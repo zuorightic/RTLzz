@@ -51,7 +51,7 @@ python3 scripts/differential_rtl.py testv2/fixtures/inline_misc.logic.cpp --top 
 
 Pass `--circt` to run the same C++/RTL differential test through the CIRCT
 backend. `regression.sh` scans combinational fixtures with both native and CIRCT emitters,
-then scans `testv2/fixtures/pipeline_misc/` with the native backend at every
+then scans `testv2/fixtures/pipeline_misc/` with both backends at every
 internal register count from 1 through 8. Unit fixtures are kept in
 `testv2/unit_fixtures/` and are only read by their stage tests. The summary counts
 each source/backend/latency combination; any failure gives a nonzero exit status.

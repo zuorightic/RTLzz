@@ -1,4 +1,5 @@
 #include "backend/circt_bridge.hpp"
+#include "backend/pipeline.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -6,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -86,8 +88,10 @@ class Lowerer {
 public:
     Lowerer(const beir::Program& program,
             bool module_body,
-            const std::vector<std::pair<std::string, std::string>>& bindings)
-        : program_(program), module_body_(module_body) {
+            const std::vector<std::pair<std::string, std::string>>& bindings,
+            const pipeline::Program* pipeline = nullptr)
+        : program_(program), module_body_(module_body), pipeline_(pipeline) {
+        if (pipeline_) pipeline::validateProgram(*pipeline_);
         if (!program.function_name.empty()) module_name_ = sanitize(program.function_name);
         for (const auto& port : program_.ports)
             has_array_ports_ = has_array_ports_ || port.type.isArray();
@@ -98,6 +102,7 @@ public:
                 throw std::runtime_error("CIRCT bridge received duplicate port binding '" + port + "'");
         }
         collectPorts();
+        reserveRegisters();
     }
 
     std::string moduleName() const { return impl_module_name_; }
@@ -108,6 +113,7 @@ public:
         for (const auto& port : inputs_) appendPort(out, first, "in", port.name, port.width);
         for (const auto& port : outputs_) appendPort(out, first, "out", port.name, port.width);
         out << ") {\n";
+        emitRegisters(out);
         std::vector<std::string> output_values;
         output_values.reserve(outputs_.size());
         for (const auto& output : outputs_) output_values.push_back(valueForNode(output.node, out));
@@ -154,9 +160,13 @@ private:
         return exported.substr(begin, end + std::string("endmodule").size() - begin) + "\n";
     }
 
-    struct PortValue { NodeId node; std::string name; int width; std::string binding; bool input; };
+    struct PortValue { NodeId node; std::string name; int width; std::string binding; bool input; std::string outer; };
+    struct ScalarValue { std::string value; int width; };
     const beir::Program& program_;
     bool module_body_;
+    const pipeline::Program* pipeline_;
+    std::unordered_map<std::string, std::string> control_values_;
+    std::unordered_set<std::string> ssa_names_;
     std::unordered_map<std::string, std::string> bindings_;
     std::string module_name_ = "rtlzz_circt_logic";
     std::string impl_module_name_ = "rtlzz_circt_logic";
@@ -164,7 +174,7 @@ private:
     std::vector<PortValue> inputs_;
     std::vector<PortValue> outputs_;
     std::unordered_map<NodeId, std::string> values_;
-    std::unordered_map<NodeId, std::vector<beir::Operand>> arrays_;
+    std::unordered_map<NodeId, std::vector<ScalarValue>> arrays_;
     std::unordered_set<NodeId> lowering_;
     unsigned temporary_ = 0;
 
@@ -198,6 +208,20 @@ private:
         std::unordered_set<std::string> names;
         for (const auto& port : program_.ports) {
             if (port.direction == beir::PortDirection::Unknown) continue;
+            if (port.element_nodes.empty()) {
+                const bool control = pipeline_ && pipeline_->options.register_stages > 0 &&
+                    (port.name == pipeline_->options.clock_name ||
+                     (pipeline_->options.reset_enabled && port.name == pipeline_->options.reset_name));
+                if (!control || port.direction != beir::PortDirection::Input || port.type.isArray() || widthOf(port.type) != 1)
+                    throw std::runtime_error("CIRCT bridge encountered a port without element nodes: " + port.name);
+                const auto name = portName(port, 0);
+                if (!names.insert(name).second)
+                    throw std::runtime_error("CIRCT bridge port name collision for '" + name + "'");
+                ssa_names_.insert(name);
+                control_values_[port.name] = "%" + name;
+                inputs_.push_back({beir::kInvalidNodeId, name, 1, bindingFor(port, 0), true, sanitize(port.name)});
+                continue;
+            }
             for (std::size_t index = 0; index < port.element_nodes.size(); ++index) {
                 const NodeId node = port.element_nodes[index];
                 const auto& signal = program_.signal(node);
@@ -207,7 +231,8 @@ private:
                 if (!names.insert(name).second)
                     throw std::runtime_error("CIRCT bridge port name collision for '" + name + "'");
                 PortValue value{node, name, widthOf(signal.type), bindingFor(port, index),
-                                port.direction == beir::PortDirection::Input};
+                                port.direction == beir::PortDirection::Input, arrayPortRef(port, index)};
+                ssa_names_.insert(name);
                 if (value.input) {
                     if (seen_inputs.insert(node).second) {
                         values_[node] = "%" + name;
@@ -221,7 +246,86 @@ private:
         if (outputs_.empty()) throw std::runtime_error("CIRCT bridge requires at least one BEIR output port");
     }
 
-    std::string fresh() { return "%t" + std::to_string(temporary_++); }
+    std::string named(std::string name) {
+        name = sanitize(std::move(name));
+        while (!ssa_names_.insert(name).second) name += "_";
+        return "%" + name;
+    }
+    std::string fresh() { return named("t" + std::to_string(temporary_++)); }
+
+    static std::size_t elementCount(const beir::ValueType& type) {
+        std::size_t count = 1;
+        for (int dim : type.array_dims) {
+            if (dim <= 0 || count > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(dim))
+                throw std::runtime_error("CIRCT bridge invalid array size");
+            count *= static_cast<std::size_t>(dim);
+        }
+        return count;
+    }
+
+    void reserveRegisters() {
+        if (!pipeline_) return;
+        for (const auto& reg : pipeline_->registers) {
+            const auto& signal = program_.signal(reg.node);
+            if (!signal.type.isArray()) values_[reg.node] = named(signal.name);
+            else {
+                auto& entries = arrays_[reg.node];
+                for (std::size_t i = 0; i < elementCount(signal.type); ++i)
+                    entries.push_back({named(signal.name + "_" + std::to_string(i)), widthOf(signal.type)});
+            }
+        }
+    }
+
+    void emitRegisters(std::ostream& out) {
+        if (!pipeline_ || pipeline_->registers.empty()) return;
+        const auto& options = pipeline_->options;
+        const auto clock = fresh();
+        out << "  " << clock << " = seq.to_clock " << control_values_.at(options.clock_name) << "\n";
+        std::string reset;
+        if (options.reset_enabled) {
+            reset = control_values_.at(options.reset_name);
+            if (options.reset_active_low) {
+                const auto one = emitUnsignedConstant(out, 1, 1);
+                const auto inverted = fresh();
+                out << "  " << inverted << " = comb.xor " << reset << ", " << one << " : i1\n";
+                reset = inverted;
+            }
+        }
+        for (const auto& reg : pipeline_->registers) {
+            const auto& signal = program_.signal(reg.node);
+            const int width = widthOf(signal.type);
+            std::vector<ScalarValue> sources, targets;
+            if (signal.type.isArray()) {
+                beir::Operand source; source.kind = beir::OperandKind::Symbol;
+                source.node = reg.source; source.type = signal.type;
+                sources = arrayValues(source, out);
+                targets = arrays_.at(reg.node);
+            } else {
+                sources.push_back({valueForNode(reg.source, out), width});
+                targets.push_back({values_.at(reg.node), width});
+            }
+            if (sources.size() != targets.size()) throw std::runtime_error("CIRCT bridge register array shape mismatch");
+            const bool enabled = reg.enable != beir::kInvalidNodeId;
+            const auto enable = enabled ? valueForNode(reg.enable, out) : std::string();
+            const std::size_t stride = (static_cast<std::size_t>(width) + 63) / 64;
+            if (options.reset_enabled && reg.reset_values.size() != stride * targets.size())
+                throw std::runtime_error("CIRCT bridge missing register reset literal");
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                const auto data = resize(sources[i].value, sources[i].width, width, false, out);
+                std::string reset_value;
+                if (options.reset_enabled) {
+                    beir::Operand::Constant literal; literal.width = width;
+                    literal.limbs.assign(reg.reset_values.begin() + i*stride, reg.reset_values.begin() + (i+1)*stride);
+                    reset_value = emitConstant(out, literal, width);
+                }
+                out << "  " << targets[i].value << " = seq.compreg" << (enabled ? ".ce " : " ")
+                    << data << ", " << clock;
+                if (enabled) out << ", " << enable;
+                if (options.reset_enabled) out << " reset " << reset << ", " << reset_value;
+                out << " : " << typeOf(width) << "\n";
+            }
+        }
+    }
     std::string emitConstant(std::ostream& out, const beir::Operand::Constant& constant, int width) {
         beir::Operand::Constant normalized = constant;
         normalized.width = width;
@@ -370,31 +474,38 @@ private:
         return result;
     }
 
-    std::vector<beir::Operand> arrayElements(beir::Operand array) const {
+    std::vector<ScalarValue> arrayValues(beir::Operand array, std::ostream& out) {
         for (std::size_t depth = 0; depth <= program_.signals.size(); ++depth) {
             if (array.kind != beir::OperandKind::Symbol) break;
+            // A registered array resolves to its Q values, never its D driver.
             auto found = arrays_.find(array.node);
             if (found != arrays_.end()) return found->second;
             const auto* signal = program_.findSignal(array.node);
             if (!signal || !signal->driver) break;
             const auto& op = *signal->driver;
-            if (op.kind == beir::OperationKind::Aggregate) return op.operands;
+            if (op.kind == beir::OperationKind::Aggregate) {
+                std::vector<ScalarValue> entries;
+                for (const auto& operand : op.operands)
+                    entries.push_back({value(operand, out), widthOf(operand.type)});
+                arrays_[array.node] = entries;
+                return entries;
+            }
             if (op.kind != beir::OperationKind::Assign || op.operands.size() != 1) break;
             array = op.operands[0];
         }
-        throw std::runtime_error("CIRCT bridge Lookup requires an Aggregate-backed signal-level array");
+        throw std::runtime_error("CIRCT bridge requires an Aggregate or registered signal-level array");
     }
 
     std::string lookup(const beir::Operation& op, std::ostream& out) {
         if (op.operands.size() != 2) throw std::runtime_error("CIRCT bridge malformed Lookup");
-        const auto entries = arrayElements(op.operands[0]);
+        const auto entries = arrayValues(op.operands[0], out);
         const int result_width = widthOf(op.type);
         std::string result = emitUnsignedConstant(out, 0, result_width);
         for (std::size_t index = entries.size(); index > 0; --index) {
             const std::string condition = compare(beir::OpCode::Eq, op.operands[1],
                                                   literal(index - 1, widthOf(op.operands[1].type)), out);
             const auto& entry = entries[index - 1];
-            const std::string selected = resize(value(entry, out), widthOf(entry.type), result_width, false, out);
+            const std::string selected = resize(entry.value, entry.width, result_width, false, out);
             result = mux(condition, selected, result, result_width, out);
         }
         return result;
@@ -664,7 +775,8 @@ private:
             return;
         }
         if (op.kind == beir::OperationKind::Aggregate) {
-            arrays_[signal.id] = op.operands;
+            beir::Operand array; array.kind = beir::OperandKind::Symbol; array.node = signal.id; array.type = signal.type;
+            arrayValues(array, out);
             return;
         }
         if (signal.type.isArray()) throw std::runtime_error("CIRCT bridge only supports Aggregate signal arrays");
@@ -730,15 +842,11 @@ private:
         out << "\n);\n";
         out << "  " << impl_module_name_ << " u_circt_impl (\n";
         bool first_connection = true;
-        for (const auto& port : program_.ports) {
-            if (port.direction == beir::PortDirection::Unknown) continue;
-            for (std::size_t index = 0; index < port.element_nodes.size(); ++index) {
+        for (const auto* ports : {&inputs_, &outputs_}) {
+            for (const auto& port : *ports) {
                 if (!first_connection) out << ",\n";
                 first_connection = false;
-                const std::string inner = portName(port, index);
-                const std::string outer = port.type.isArray()
-                    ? arrayPortRef(port, index) : sanitize(port.name);
-                out << "    ." << inner << "(" << outer << ")";
+                out << "    ." << port.name << "(" << port.outer << ")";
             }
         }
         out << "\n  );\nendmodule\n";
@@ -761,14 +869,14 @@ std::filesystem::path temporaryDirectory() {
 
 } // namespace
 
-Result emitSystemVerilog(const beir::Program& program,
+static Result emitSystemVerilogImpl(const beir::Program& program,
                          bool module_body,
                          const std::vector<std::pair<std::string, std::string>>& port_bindings,
-                         bool retain_intermediates) {
+                         bool retain_intermediates, const pipeline::Program* pipeline) {
     Result result;
     std::filesystem::path directory;
     try {
-        Lowerer lowerer(program, module_body, port_bindings);
+        Lowerer lowerer(program, module_body, port_bindings, pipeline);
         directory = temporaryDirectory();
         const auto input = directory / "input.mlir";
         const auto output = directory / "output.txt";
@@ -778,7 +886,7 @@ Result emitSystemVerilog(const beir::Program& program,
             "circt-opt --comb-assume-two-valued --canonicalize --cse "
             "--comb-int-range-narrowing --canonicalize --cse "
             "--comb-overflow-annotating --comb-balance-mux --canonicalize --cse "
-            "--lower-comb --canonicalize --cse --hw-legalize-modules "
+            "--lower-seq-compreg-ce --lower-seq-to-sv --lower-comb --canonicalize --cse --hw-legalize-modules "
             "--prettify-verilog --export-verilog " +
             shellQuote(input.string()) + " > " + shellQuote(output.string()) + " 2> " + shellQuote(error.string());
         const int raw_status = std::system(command.c_str());
@@ -811,6 +919,18 @@ Result emitSystemVerilog(const beir::Program& program,
         }
     }
     return result;
+}
+
+Result emitSystemVerilog(const beir::Program& program, bool module_body,
+                         const std::vector<std::pair<std::string, std::string>>& port_bindings,
+                         bool retain_intermediates) {
+    return emitSystemVerilogImpl(program, module_body, port_bindings, retain_intermediates, nullptr);
+}
+
+Result emitSystemVerilog(const pipeline::Program& program, bool module_body,
+                         const std::vector<std::pair<std::string, std::string>>& port_bindings,
+                         bool retain_intermediates) {
+    return emitSystemVerilogImpl(program.rtl_program, module_body, port_bindings, retain_intermediates, &program);
 }
 
 } // namespace pred::circt

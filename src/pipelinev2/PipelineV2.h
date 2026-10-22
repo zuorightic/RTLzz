@@ -39,7 +39,7 @@ struct PipelineConfig {
     std::function<void(const std::string&)> progress_callback;
     OutputKind output_kind = OutputKind::Rtl;
     RtlDebugOutputKind rtl_debug_output = RtlDebugOutputKind::None;
-    // Use the external CIRCT HW/Comb bridge instead of the native SV emitter.
+    // Use the external CIRCT HW/Comb/Seq bridge instead of the native SV emitter.
     // An unavailable or failed CIRCT invocation is a compilation error.
     bool use_circt = false;
     bool rtl_module_body = false;

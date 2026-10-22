@@ -2,7 +2,7 @@
 
 本文档是当前代码树的逐文件索引。项目现在只保留 V2 编译路径：
 
-`S0 Clang18 AST -> S1 API norm -> S2 validate -> S3 statementize -> S4 CFG -> S5 unroll -> S6 inline -> S7 flatten -> S8 op norm -> S9 SSA -> S10 predicate -> S11 BEIR -> BEOPT -> optional automatic pipeline -> RTL (native; combinational CIRCT)`
+`S0 Clang18 AST -> S1 API norm -> S2 validate -> S3 statementize -> S4 CFG -> S5 unroll -> S6 inline -> S7 flatten -> S8 op norm -> S9 SSA -> S10 predicate -> S11 BEIR -> BEOPT -> optional automatic pipeline -> RTL (native or CIRCT HW/Comb/Seq)`
 
 ## 回归测试流程
 
@@ -28,6 +28,7 @@ python3 scripts/differential_rtl.py testv2/fixtures/inline_misc.logic.cpp --top 
 for src in testv2/fixtures/pipeline_misc/*.logic.cpp; do
   for stages in {1..8}; do
     python3 scripts/differential_rtl.py "$src" --top hls_main --cases 100 --latency "$stages"
+    python3 scripts/differential_rtl.py "$src" --top hls_main --cases 100 --latency "$stages" --circt
   done
 done
 
@@ -38,6 +39,8 @@ done
 ```
 
 `scripts/differential_rtl.py` 通过 `predicate-expand --format portmeta` 获取端口元数据，通过 `--format rtl` 获取 RTL，然后使用 C++ oracle 与 Verilator 做随机输入差分。`testv2/example/*.logic.cpp` 中的每个输入文件代表一个从真实硬件中摘出的模块组合逻辑函数，使用目标函数名通配 `--top 'LogicSubModule_*'` 对每个 example 进行 RTL-DIFF 差分验证。
+
+除非明确指定，不然不需要运行或增加单元测试。
 
 ## Build And Entry
 
@@ -76,7 +79,7 @@ done
 - 在 S0 至 S11 每个 frontend 阶段开始前触发可选进度回调，并转发 BEIR optimizer 的实际轮次。
 - 在 S7 后可提前输出端口 metadata。
 - 在 S11 后调用 BEIR optimizer，再输出 BEIR 文本或 SystemVerilog。
-- 校验流水线配置，在 BEOPT 后按需调度、物化、求值复位状态并发射原生时序 RTL，汇集报告和时钟／复位 metadata；CIRCT 拒绝正内部级数流水线。
+- 校验流水线配置，在 BEOPT 后按需调度、物化、求值复位状态并通过 native 或 CIRCT 发射时序 RTL，汇集报告和时钟／复位 metadata；两后端共用同一调度及物化模型。
 
 ## Shared V2 AST And Types
 
@@ -370,7 +373,8 @@ done
 - 原生 BEIR Case 输出为带完整 default 的 `always_comb unique case (1'b1)`，向 RTL 工具声明分支条件互斥；省略位宽适配后的赋值表达式与 default 完全相同的分支。
 
 ### `src/backend/circt_bridge.hpp` / `src/backend/circt_bridge.cpp`
-- 将 BEOPT 后的纯组合 BEIR lower 为 CIRCT HW/Comb IR，调用 `circt-opt --canonicalize --cse --hw-cleanup --lower-hw-to-sv --export-verilog`，并提取导出的 Verilog module 或 module body。
+- 组合 BEIR 和物化后的 `pipeline::Program` 共用 Lowerer 及单一 `emitSystemVerilogImpl` 工具调用路径，生成 HW/Comb/Seq；已有组合优化之后执行 `--lower-seq-compreg-ce --lower-seq-to-sv --lower-comb --canonicalize --cse --hw-legalize-modules --prettify-verilog --export-verilog`。
+- 寄存器 Q 预先登记，Seq 时序边界不按组合 Assign 展开；数组寄存器逐元素生成，Lookup/Assign 通过统一数组 SSA 解析访问 Q。控制端口显式收集并参加绑定／数组包装，支持同步复位、宽位初值和 valid 使能。
 - 支持标量组合运算、首真优先 Case、Aggregate-backed signal Lookup、动态位/片选择和动态位/片写入；module-body 端口绑定按 row-major 还原全部数组维度（包括单元素数组）；动态操作被 lower 为明确的组合选择网络。
 - `--circt` / `CompileOptions::use_circt` 显式启用。CIRCT 缺失、IR 不支持或优化失败均为编译错误，不回退 native emitter；非 release 调用保留输入 MLIR、导出输出和 stderr 以供诊断。
 - RTL emission 将全常量 Aggregate 的 Lookup/ArrayAccess 输出为组合 case 查表函数；按元素类型、表长及规范化常量位值建立哈希索引，以完整比较处理哈希冲突，同一模块内相同表复用函数；可追踪赋值及无符号宽度转换链，省略不再被使用的数组，运行时表项保持数组读取。

@@ -783,8 +783,6 @@ def main() -> int:
     args = ap.parse_args()
     if args.latency is not None and args.latency < 0:
         ap.error("--latency must be non-negative")
-    if args.circt and args.latency is not None and args.latency > 0:
-        ap.error("positive --latency requires the native backend (omit --circt)")
     if args.cases <= 0:
         ap.error("--cases must be positive")
 

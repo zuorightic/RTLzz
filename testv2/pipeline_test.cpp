@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 
+static bool test_circt = false;
 #define CHECK(x) do { if (!(x)) { std::cerr << __LINE__ << ": " << #x << "\n"; std::exit(1); } } while (false)
 using namespace pred;
 using namespace beir;
@@ -131,7 +132,7 @@ static void testAlignment() {
 }
 
 static rtlzz::CompileOptions sourceOptions() {
-    rtlzz::CompileOptions o;
+    rtlzz::CompileOptions o; o.use_circt = test_circt;
     o.source_codelines = {"#include <array>\n#include <fixint.hpp>\nInt<8> a;\n#pragma input_port a\nstd::array<Int<8>, 2> y;\n#pragma output_port y\nvoid top() { y[0] = a + Int<8>(1); y[1] = a; }"};
     o.top_function = "top"; o.vullib_dir = "third_party/vulsim/vullib";
     return o;
@@ -141,7 +142,8 @@ static void testApiAndErrors() {
     auto o = sourceOptions();
     auto combo = rtlzz::compileToRtl(o); if (!combo.ok()) std::cerr << combo.error << "\n"; CHECK(combo.ok());
     o.register_stages = 0;
-    CHECK(rtlzz::compileToRtl(o).output_codelines == combo.output_codelines);
+    if (!test_circt) CHECK(rtlzz::compileToRtl(o).output_codelines == combo.output_codelines);
+    else CHECK(rtlzz::compileToRtl(o).ok()); // CIRCT source comments contain unique temporary paths.
     o.register_stages = 2;
     auto piped = rtlzz::compileToRtl(o);
     if (!piped.ok()) std::cerr << piped.error << "\n";
@@ -164,8 +166,16 @@ static void testApiAndErrors() {
     CHECK(joinCodeLines(body.output_codelines).find("assign clk = external_clk") != std::string::npos);
     o.rtl_port_bindings.pop_back(); CHECK(!rtlzz::compileToRtl(o).ok());
     o.rtl_module_body = false; o.use_circt = true;
-    CHECK(rtlzz::compileToRtl(o).error.find("CIRCT") != std::string::npos);
-    o.use_circt = false;
+    auto circt = rtlzz::compileToRtl(o); CHECK(circt.ok());
+    CHECK(circt.pipeline_report->register_bits == piped.pipeline_report->register_bits);
+    CHECK(circt.pipeline_report->stage_delays == piped.pipeline_report->stage_delays);
+    CHECK(circt.pipeline_report->baseline_delay == piped.pipeline_report->baseline_delay);
+    CHECK(circt.pipeline_report->allowed_delay == piped.pipeline_report->allowed_delay);
+    CHECK(circt.pipeline_report->final_delay == piped.pipeline_report->final_delay);
+    CHECK(circt.pipeline_report->baseline_register_bits == piped.pipeline_report->baseline_register_bits);
+    CHECK(circt.pipeline_report->register_count == piped.pipeline_report->register_count);
+    CHECK(circt.pipeline_report->output_reset_values == piped.pipeline_report->output_reset_values);
+    o.use_circt = test_circt;
     for (const auto& name : {"a", "always_ff", "table", "unique", "bad-clock", ""}) {
         o.clock_name = name; CHECK(!rtlzz::compileToRtl(o).ok());
     }
@@ -216,7 +226,13 @@ endmodule
 }
 
 int main(int argc, char** argv) {
+    std::string artifact;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--circt") test_circt = true;
+        else artifact = argv[i];
+    }
+
     testTradeoff(); testAlignment(); testApiAndErrors();
-    if (argc == 2) emitBodyTestbench(argv[1]);
+    if (!artifact.empty()) emitBodyTestbench(artifact);
     std::cout << "pipeline tests passed\n";
 }

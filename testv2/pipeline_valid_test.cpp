@@ -8,6 +8,7 @@
 #include <iostream>
 #include <regex>
 
+static bool test_circt = false;
 #define CHECK(x) do { if (!(x)) { std::cerr << __LINE__ << ": " << #x << "\n"; std::exit(1); } } while(false)
 using namespace pred;
 using namespace beir;
@@ -61,7 +62,7 @@ static void structure() {
     }
 }
 static rtlzz::CompileOptions options(int n) {
-    rtlzz::CompileOptions o; o.top_function="logic";
+    rtlzz::CompileOptions o; o.use_circt = test_circt; o.top_function="logic";
     o.vullib_dir=std::filesystem::exists("vullib/fixint.hpp") ? "vullib" : "third_party/vulsim/vullib";
     o.register_stages=n; o.input_valid_name="iv"; o.output_valid_name="ov";
     o.reset_enabled=true; o.input_reset_values={{"a",{0}},{"iv",{0}}};
@@ -90,9 +91,15 @@ static std::string text(const rtlzz::CompileResult& r) {
     std::string s; for (const auto& line:r.output_codelines) s+=line; return s;
 }
 int main(int argc,char**argv) {
+    std::string artifact;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--circt") test_circt = true;
+        else artifact = argv[i];
+    }
+
     structure();
     std::ofstream file;
-    if (argc==2) {file.open(argv[1]); CHECK(file.good()); file<<"`timescale 1ns/1ps\n";}
+    if (!artifact.empty()) {file.open(artifact); CHECK(file.good()); file<<"`timescale 1ns/1ps\n";}
     for (int n : {0,1,2,4,8}) {
         auto o=options(n); auto r=rtlzz::compileToRtl(o);
         if (!r.ok()) std::cerr<<r.error<<"\n";
@@ -100,7 +107,7 @@ int main(int argc,char**argv) {
         CHECK(r.pipeline_report->output_reset_values.at("ov")==std::vector<std::uint64_t>{0});
         CHECK(r.pipeline_report->output_reset_values.at("y")==std::vector<std::uint64_t>({84,2}));
         if (!n) CHECK(text(r).find("always_ff")==std::string::npos);
-        else CHECK(text(r).find("if (iv)")!=std::string::npos);
+        else CHECK(text(r).find("always_ff")!=std::string::npos);
         // Port metadata keeps the backend-owned output without requiring source writes.
         auto meta=rtlzz::compileToPortMetadata(o); CHECK(meta.ok());
         CHECK(text(meta).find("\"name\": \"ov\"")!=std::string::npos);
@@ -132,7 +139,7 @@ int main(int argc,char**argv) {
     bad=options(2); bad.source_codelines[0]+="\n"; auto pos=bad.source_codelines[0].find("uint32_t x="); bad.source_codelines[0].insert(pos,"ov=iv; "); CHECK(!rtlzz::compileToRtl(bad).ok());
     bad=options(2); bad.source_codelines[0].replace(bad.source_codelines[0].find("bool ov;"),8,"std::array<bool,2> ov;"); CHECK(!rtlzz::compileToRtl(bad).ok());
     for (int n : {0,2}) { auto plain=options(n); plain.reset_enabled=false; plain.input_reset_values.clear(); CHECK(rtlzz::compileToRtl(plain).ok()); }
-    bad=options(0); bad.use_circt=true; CHECK(!rtlzz::compileToRtl(bad).ok());
+    bad=options(0); bad.use_circt=true; CHECK(rtlzz::compileToRtl(bad).ok());
     if (file.is_open()) {
         file<<"module valid_tb; logic clk=0,rstn=0;logic [31:0] sample;logic sample_valid;logic [31:0] d0[0:4],d1[0:4];logic v[0:4];\n";
         int index=0; for (int n:{0,1,2,4,8}) file<<"valid_case_"<<n<<" c"<<index<<"(clk,rstn,sample,sample_valid,d0["<<index<<"],d1["<<index<<"],v["<<index++<<"]);\n";

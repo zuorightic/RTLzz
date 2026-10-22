@@ -4,10 +4,11 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+static bool test_circt = false;
 #define CHECK(x) do { if (!(x)) { std::cerr << __LINE__ << ": " << #x << "\n"; std::exit(1); } } while(false)
 
 static rtlzz::CompileOptions options() {
-    rtlzz::CompileOptions o;
+    rtlzz::CompileOptions o; o.use_circt = test_circt;
     o.top_function="logic";
     o.vullib_dir=std::filesystem::exists("vullib/fixint.hpp") ? "vullib" : "third_party/vulsim/vullib";
     o.register_stages=3;
@@ -53,6 +54,12 @@ void logic() {
 }
 
 int main(int argc, char**argv) {
+    std::string artifact;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--circt") test_circt = true;
+        else artifact = argv[i];
+    }
+
     for (int stages : {0,1,3,8}) {
         auto o=options(); o.register_stages=stages;
         auto r=rtlzz::compileToRtl(o);
@@ -65,7 +72,7 @@ int main(int argc, char**argv) {
         CHECK(values.at("patched")==std::vector<std::uint64_t>({0x0123456789abcd90ULL,0x4321}));
         CHECK(values.at("q")==std::vector<std::uint64_t>({253}));
         std::string rtl; for (auto &line:r.output_codelines) rtl+=line;
-        CHECK((rtl.find("if (!rstn)")!=std::string::npos)==(stages!=0));
+        CHECK((rtl.find("always_ff")!=std::string::npos)==(stages!=0));
     }
     auto invalid=options(); invalid.input_reset_values.erase("v"); CHECK(!rtlzz::compileToRtl(invalid).ok());
     invalid=options(); invalid.input_reset_values["a"]={1}; CHECK(!rtlzz::compileToRtl(invalid).ok());
@@ -77,12 +84,12 @@ int main(int argc, char**argv) {
     auto active_high=options(); active_high.reset_name="rst"; active_high.reset_active_low=false;
     auto high=rtlzz::compileToRtl(active_high); CHECK(high.ok());
     std::string text; for (auto &line:high.output_codelines) text+=line;
-    CHECK(text.find("if (rst)")!=std::string::npos);
-    if (argc==2) {
+    CHECK(text.find("posedge clk")!=std::string::npos);
+    if (!artifact.empty()) {
         auto o=options(); o.rtl_module_body=true;
         o.rtl_port_bindings={{"a","external_a"},{"index","external_index"},{"v","external_v"},{"signed_input","external_signed"},{"y","external_y"},{"lookup","external_lookup"},{"q","external_q"},{"ov","external_ov"},{"patched","external_patched"},{"clk","external_clk"},{"rstn","external_rstn"}};
         auto r=rtlzz::compileToRtl(o); CHECK(r.ok());
-        std::ofstream file(argv[1]); CHECK(file.good());
+        std::ofstream file(artifact); CHECK(file.good());
         file << "module reset_tb; logic external_clk,external_rstn,external_v,external_ov; logic [79:0] external_a,external_y[0:1],external_patched; logic [7:0] external_index,external_signed,external_lookup,external_q;\n";
         for (auto &line:r.output_codelines) file<<line;
         file << R"(

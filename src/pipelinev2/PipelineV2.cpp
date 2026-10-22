@@ -428,8 +428,6 @@ PipelineResult compile(const PipelineConfig& config) {
     try {
         if (config.pipeline) {
             pipeline::validateOptions(*config.pipeline);
-            if ((config.pipeline->register_stages > 0 || !config.pipeline->input_valid_name.empty()) && config.use_circt)
-                return errorResult("config", "CIRCT does not support automatic pipelines");
         }
         const auto report_frontend_stage = [&config](const char* stage) {
             if (config.progress_callback) {
@@ -580,11 +578,10 @@ PipelineResult compile(const PipelineConfig& config) {
         case OutputKind::Rtl:
             if (config.use_circt) {
                 if (config.progress_callback) config.progress_callback("RTLzz CIRCT lowering and optimization");
-                auto circt_result = circt::emitSystemVerilog(
-                    beir_program,
-                    config.rtl_module_body,
-                    config.rtl_port_bindings,
-                    config.rtl_debug_output != RtlDebugOutputKind::None);
+                const bool retain = config.rtl_debug_output != RtlDebugOutputKind::None;
+                auto circt_result = result.pipeline_program
+                    ? circt::emitSystemVerilog(*result.pipeline_program, config.rtl_module_body, config.rtl_port_bindings, retain)
+                    : circt::emitSystemVerilog(beir_program, config.rtl_module_body, config.rtl_port_bindings, retain);
                 if (!circt_result.ok()) {
                     std::string detail = circt_result.error;
                     if (!circt_result.input_mlir_path.empty())

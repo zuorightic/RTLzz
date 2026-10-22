@@ -106,11 +106,10 @@ struct CompileOptions {
     // BEIR optimization options. Empty means the default optimization pipeline;
     // use {"none"} to disable all BEIR optimization passes.
     std::vector<std::string> beopt_args;
-    // Emit RTL through the external CIRCT HW/Comb bridge.  This is opt-in;
+    // Emit RTL through the external CIRCT HW/Comb/Seq bridge.  This is opt-in;
     // failures are reported rather than falling back to the native emitter.
-    // Positive register_stages is supported only by the native backend; using
-    // CIRCT with a positive stage count or an explicit valid channel reports
-    // a compilation error.
+    // Combinational and automatic-pipeline compilation share the same bridge;
+    // Seq operations preserve the schedule, valid enables and synchronous reset.
     bool use_circt = false;
     // Optional progress hook used by embedding tools. It reports frontend
     // stages and backend optimization iterations; standalone calls are silent.
@@ -150,7 +149,7 @@ struct CompileOptions {
     // registers update only when their source stage is valid. Direct reads of
     // input_valid_name are aligned to the consuming computation stage.
     // N=0 directly drives the valid output without clock/reset ports. Data is
-    // meaningful only while output valid is true. Native backend only.
+    // meaningful only while output valid is true. Supported by both backends.
     std::string input_valid_name;
     std::string output_valid_name;
     // Opt in to reset-value evaluation after scheduling. Supply all input data

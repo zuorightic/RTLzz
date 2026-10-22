@@ -34,6 +34,7 @@
     while IFS= read -r -d '' file; do
         for stages in {1..8}; do
             run_case "$file" --latency "$stages"
+            run_case "$file" --latency "$stages" --circt
         done
     done < <(find testv2/fixtures/pipeline_misc -type f -name '*.logic.cpp' -print0 | sort -z)
 
