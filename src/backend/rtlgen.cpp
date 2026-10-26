@@ -984,10 +984,18 @@ private:
                 return portElementRef(ops[0], static_cast<std::size_t>(ops[1].constant.toU64()));
             }
             return operand(ops[0]) + "[" + operand(ops[1]) + "]";
-        case beir::OperationKind::AddCarry:
+        case beir::OperationKind::AddCarry: {
             need(3);
-            return std::to_string(widthOf(op.type)) + "'((" + operand(ops[0]) + " + " +
-                   operand(ops[1]) + " + " + operand(ops[2]) + "))";
+            const int width = widthOf(op.type);
+            // AddCarry is unsigned. Size every operand before addition so the
+            // one-bit carry is explicitly zero-extended, including after BEOPT
+            // narrows the result. The sum is modulo the BEIR result width.
+            auto addend = [&](const beir::Operand& value) {
+                return resizeExpr(operand(value), widthOf(value.type), width, false);
+            };
+            return std::to_string(width) + "'((" + addend(ops[0]) + " + " +
+                   addend(ops[1]) + " + " + addend(ops[2]) + "))";
+        }
         case beir::OperationKind::Binary:
             need(2);
             {
