@@ -7,7 +7,6 @@
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace pred::beir {
@@ -25,6 +24,7 @@ enum class OperationKind {
     Assign,
     PortRead,
     AddCarry,
+    F32MulRNE,
     Binary,
     Unary,
     ArrayAccess,
@@ -158,6 +158,10 @@ struct Operation {
     int times = 0;
     std::vector<DebugLoc> source_locs;
     DebugInfo debug;
+    // Stable semantic occurrence assigned before BEOPT, never a debug location
+    // or NodeId. Cloned helper invocations receive distinct occurrences.
+    std::string arithmetic_origin;
+
 };
 
 inline bool hasValidCaseShape(const Operation& op) {
@@ -187,12 +191,26 @@ struct Port {
     std::vector<NodeId> element_nodes;
 };
 
+struct ArithmeticRegion {
+    std::string id;
+    std::string operation = "fp32_mul_rne";
+    std::string semantics = "binary32-rne-tininess-after-canonicalNaN-v1";
+    std::string template_version = "softfloat3d-bitvector-mul-v1";
+    std::string sharing_policy = "semantic-marker-and-isolated-BEOPT-v1";
+    std::vector<Operand> inputs;
+    std::vector<NodeId> outputs;
+    std::vector<NodeId> members;
+    // No internal split is enabled in step4, for any experiment group.
+    std::vector<std::vector<NodeId>> legal_cut_groups;
+};
+
 struct Program {
     std::string function_name;
     std::vector<std::string> inputs;
     std::vector<std::string> outputs;
     std::vector<Port> ports;
     std::vector<Signal> signals;
+    std::vector<ArithmeticRegion> arithmetic_regions;
 
     // Backend-generated signal names are allocated lazily by appendTemp.  The
     // cache avoids rebuilding a full name set for every temporary signal.

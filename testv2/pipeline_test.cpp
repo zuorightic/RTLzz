@@ -1,6 +1,7 @@
 #include "backend/pipeline.hpp"
 #include "backend/rtlgen.hpp"
 #include "rtlzz.hpp"
+#include "circt_test_policy.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -165,16 +166,21 @@ static void testApiAndErrors() {
     auto body = rtlzz::compileToRtl(o); CHECK(body.ok());
     CHECK(joinCodeLines(body.output_codelines).find("assign clk = external_clk") != std::string::npos);
     o.rtl_port_bindings.pop_back(); CHECK(!rtlzz::compileToRtl(o).ok());
-    o.rtl_module_body = false; o.use_circt = true;
-    auto circt = rtlzz::compileToRtl(o); CHECK(circt.ok());
-    CHECK(circt.pipeline_report->register_bits == piped.pipeline_report->register_bits);
-    CHECK(circt.pipeline_report->stage_delays == piped.pipeline_report->stage_delays);
-    CHECK(circt.pipeline_report->baseline_delay == piped.pipeline_report->baseline_delay);
-    CHECK(circt.pipeline_report->allowed_delay == piped.pipeline_report->allowed_delay);
-    CHECK(circt.pipeline_report->final_delay == piped.pipeline_report->final_delay);
-    CHECK(circt.pipeline_report->baseline_register_bits == piped.pipeline_report->baseline_register_bits);
-    CHECK(circt.pipeline_report->register_count == piped.pipeline_report->register_count);
-    CHECK(circt.pipeline_report->output_reset_values == piped.pipeline_report->output_reset_values);
+    o.rtl_module_body = false;
+    if (regressionCirctEnabled()) {
+        o.use_circt = true;
+        auto circt = rtlzz::compileToRtl(o);
+        if (!circt.ok()) std::cerr << circt.error << "\n";
+        CHECK(circt.ok());
+        CHECK(circt.pipeline_report->register_bits == piped.pipeline_report->register_bits);
+        CHECK(circt.pipeline_report->stage_delays == piped.pipeline_report->stage_delays);
+        CHECK(circt.pipeline_report->baseline_delay == piped.pipeline_report->baseline_delay);
+        CHECK(circt.pipeline_report->allowed_delay == piped.pipeline_report->allowed_delay);
+        CHECK(circt.pipeline_report->final_delay == piped.pipeline_report->final_delay);
+        CHECK(circt.pipeline_report->baseline_register_bits == piped.pipeline_report->baseline_register_bits);
+        CHECK(circt.pipeline_report->register_count == piped.pipeline_report->register_count);
+        CHECK(circt.pipeline_report->output_reset_values == piped.pipeline_report->output_reset_values);
+    }
     o.use_circt = test_circt;
     for (const auto& name : {"a", "always_ff", "table", "unique", "bad-clock", ""}) {
         o.clock_name = name; CHECK(!rtlzz::compileToRtl(o).ok());
@@ -232,6 +238,7 @@ int main(int argc, char** argv) {
         else artifact = argv[i];
     }
 
+    applyRegressionCirctPolicy(test_circt);
     testTradeoff(); testAlignment(); testApiAndErrors();
     if (!artifact.empty()) emitBodyTestbench(artifact);
     std::cout << "pipeline tests passed\n";

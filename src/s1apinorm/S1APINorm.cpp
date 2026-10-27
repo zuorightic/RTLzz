@@ -740,6 +740,15 @@ private:
                                    expr.to_width);
         }
 
+        if (callee == "__rtlzz_fp32_mul_rne") {
+            if (args.size() != 2 || expr.type.width != 37 ||
+                args[0]->type.width != 32 || args[1]->type.width != 32)
+                fail("F32MulRNE requires two uint32 bit patterns and a packed uint37 result", expr.debug_loc);
+            auto out = makeHardware(S1HardwareOp::F32MulRNE, expr.type, expr.debug_loc);
+            out->parts = std::move(args);
+            ++stats.normalized_calls;
+            return out;
+        }
         if (callee == "AddCarry") {
             if ((args.size() != 2 && args.size() != 3) || expr.type.width <= 1)
                 fail("AddCarry requires two or three operands and result width > 1", expr.debug_loc);
@@ -871,6 +880,7 @@ const char* hardwareOpName(S1HardwareOp op) {
     case S1HardwareOp::Concat: return "Concat";
     case S1HardwareOp::Repeat: return "Repeat";
     case S1HardwareOp::AddCarry: return "AddCarry";
+    case S1HardwareOp::F32MulRNE: return "F32MulRNE";
     case S1HardwareOp::ReduceOr: return "ReduceOr";
     case S1HardwareOp::ReduceAnd: return "ReduceAnd";
     case S1HardwareOp::ReduceXor: return "ReduceXor";

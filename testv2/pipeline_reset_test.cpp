@@ -1,4 +1,5 @@
 #include "rtlzz.hpp"
+#include "circt_test_policy.hpp"
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
@@ -60,6 +61,7 @@ int main(int argc, char**argv) {
         else artifact = argv[i];
     }
 
+    applyRegressionCirctPolicy(test_circt);
     for (int stages : {0,1,3,8}) {
         auto o=options(); o.register_stages=stages;
         auto r=rtlzz::compileToRtl(o);

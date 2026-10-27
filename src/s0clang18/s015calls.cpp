@@ -171,6 +171,7 @@ bool isSupportedFixintMemberAPI(const clang::CXXMemberCallExpr* expr,
 bool isSupportedRTLZZFreeAPI(const clang::FunctionDecl* function,
                              std::string& api_name) {
     api_name = unqualifiedName(function);
+    if (function && function->getQualifiedNameAsString() == "vularith::F32MulRNE") { api_name = "__rtlzz_fp32_mul_rne"; return true; }
     return api_name == "AddCarry" ||
            api_name == "Cat" ||
            api_name == "Repeat" ||

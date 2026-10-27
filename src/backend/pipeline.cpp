@@ -1,4 +1,5 @@
 #include "backend/pipeline.hpp"
+#include "backend/arithmetic_regions.hpp"
 #include "backend/rtl_names.hpp"
 
 #include <algorithm>
@@ -89,11 +90,14 @@ struct Graph {
     std::vector<std::vector<NodeId>> users;
     std::vector<bool> live, input, output, constant;
     std::vector<double> costs;
+    std::vector<NodeId> unit_order, unit_of;
+    std::vector<std::vector<NodeId>> units;
 
     Graph(const beir::Program& program, const Options& options)
         : p(program), last(options.register_stages), users(p.signals.size()),
           live(p.signals.size()), input(live.size()), output(live.size()),
           constant(live.size()), costs(live.size()) {
+        if (!p.arithmetic_regions.empty()) beir::regions::validate(p);
         if (!options.input_valid_name.empty()) {
             for (const auto& port : p.ports) {
                 if (port.name != options.input_valid_name && port.name != options.output_valid_name) continue;
@@ -114,6 +118,10 @@ struct Graph {
                 if (port.direction == PortDirection::Output) output[id] = true;
                 pending.push_back(id);
             }
+        }
+        for (const auto& r : p.arithmetic_regions) {
+            pending.insert(pending.end(), r.outputs.begin(), r.outputs.end());
+            for (const auto& v : r.inputs) if (v.kind == OperandKind::Symbol) pending.push_back(v.node);
         }
         while (!pending.empty()) {
             auto id = pending.back(); pending.pop_back();
@@ -149,6 +157,27 @@ struct Graph {
             for (auto user : users[id]) if (!--indegree[user]) ready.push(user);
         }
         if (order.size() != count) throw std::runtime_error("pipeline: cyclic dependency graph");
+        unit_of.resize(live.size()); units.resize(live.size());
+        for (NodeId id=0; id<live.size(); ++id) unit_of[id]=id;
+        for (const auto& r:p.arithmetic_regions) {
+            auto representative=*std::min_element(r.members.begin(),r.members.end());
+            for(auto id:r.members) unit_of[id]=representative;
+        }
+        for(auto id:order) units[unit_of[id]].push_back(id);
+        std::vector<std::unordered_set<NodeId>> unit_users(live.size());
+        std::vector<unsigned> unit_degree(live.size());
+        for(auto id:order) for(auto user:users[id]) if(unit_of[id]!=unit_of[user] && unit_users[unit_of[id]].insert(unit_of[user]).second)
+            ++unit_degree[unit_of[user]];
+        std::priority_queue<NodeId,std::vector<NodeId>,std::greater<NodeId>> unit_ready;
+        for(NodeId u=0;u<units.size();++u) if(!units[u].empty() && !unit_degree[u]) unit_ready.push(u);
+        std::vector<NodeId> grouped;
+        while(!unit_ready.empty()) {
+            auto u=unit_ready.top();unit_ready.pop();unit_order.push_back(u);
+            grouped.insert(grouped.end(),units[u].begin(),units[u].end());
+            for(auto v:unit_users[u]) if(!--unit_degree[v]) unit_ready.push(v);
+        }
+        if(grouped.size()!=order.size()) throw std::runtime_error("pipeline: cyclic atomic graph");
+        order=std::move(grouped);
         for (auto id : order) {
             const auto& s = p.signal(id);
             if (input[id]) continue; // External Q and PortRead are wiring.
@@ -169,28 +198,41 @@ struct Graph {
     bool schedule(double cap, std::vector<int>& stage) const {
         stage.assign(live.size(), 0);
         std::vector<double> arrival(live.size());
-        for (auto id : order) {
-            if (input[id] || constant[id]) continue;
-            const auto& op = *p.signal(id).driver;
-            int s = 0;
-            for (const auto& v : op.operands) if (v.kind == OperandKind::Symbol && !constant[v.node])
-                s = std::max(s, stage[v.node]);
-            if (output[id]) s = last;
-            double a = 0;
-            for (const auto& v : op.operands) if (v.kind == OperandKind::Symbol && !constant[v.node] && stage[v.node] == s)
-                a = std::max(a, arrival[v.node]);
-            if (a + costs[id] > cap) { ++s; a = 0; }
-            if (s > last || costs[id] > cap) return false;
-            stage[id] = s; arrival[id] = a + costs[id];
+        for(auto u:unit_order) {
+            int start=0; bool fixed=false;
+            for(auto id:units[u]) {
+                if(output[id]) fixed=true;
+                if(p.signal(id).driver) for(const auto& v:p.signal(id).driver->operands)
+                    if(v.kind==OperandKind::Symbol && unit_of[v.node]!=u && !constant[v.node]) start=std::max(start,stage[v.node]);
+            }
+            if(fixed) start=last;
+            bool placed=false;
+            for(int at=start;at<=last && at<=start+1;++at) {
+                bool fits=true;
+                for(auto id:units[u]) {
+                    stage[id]=at;arrival[id]=0;
+                    if(input[id]) { if(at) fits=false; continue; }
+                    if(constant[id]) continue;
+                    double a=0;
+                    for(const auto& v:p.signal(id).driver->operands)
+                        if(v.kind==OperandKind::Symbol && !constant[v.node] && stage[v.node]==at)
+                            a=std::max(a,arrival[v.node]);
+                    arrival[id]=a+costs[id]; if(arrival[id]>cap) fits=false;
+                }
+                if(fits) {placed=true;break;}
+                if(fixed) break;
+            }
+            if(!placed) return false;
         }
-        // Constants have no transaction state; output wiring still belongs to N.
-        for (auto id : order) if (output[id] && constant[id]) stage[id] = last;
         return true;
     }
 
     Report evaluate(const std::vector<int>& stage) const {
         Report r; r.stage_delays.assign(static_cast<std::size_t>(last) + 1, 0);
         std::vector<double> arrival(live.size());
+        for (auto u : unit_order) for (auto id : units[u]) if (stage[id] != stage[units[u].front()]) {
+            r.final_delay = std::numeric_limits<double>::infinity(); return r;
+        }
         for (auto id : order) {
             if (stage[id] < 0 || stage[id] > last || (input[id] && stage[id] != 0) ||
                 (output[id] && stage[id] != last)) {
@@ -309,12 +351,15 @@ Program build(const beir::Program& program, const Options& options) {
         auto best = current;
         NodeId best_node = kInvalidNodeId;
         int best_stage = 0;
-        for (auto id : g.order) {
-            if (g.input[id] || g.output[id] || g.constant[id]) continue;
+        for (auto u : g.unit_order) {
+            auto id = g.units[u].front();
+            bool fixed = false;
+            for(auto member:g.units[u]) if(g.input[member] || g.output[member]) fixed=true;
+            if(fixed || std::all_of(g.units[u].begin(), g.units[u].end(), [&](auto m){return g.constant[m];})) continue;
             int original = result.stages[id];
             for (int stage = 0; stage <= g.last; ++stage) {
                 if (stage == original) continue;
-                result.stages[id] = stage;
+                for(auto member:g.units[u]) result.stages[member] = stage;
                 auto candidate = g.evaluate(result.stages);
                 if (candidate.final_delay <= allowed && candidate.register_bits < current.register_bits &&
                     (candidate.register_bits < best.register_bits ||
@@ -322,10 +367,11 @@ Program build(const beir::Program& program, const Options& options) {
                     best = std::move(candidate); best_node = id; best_stage = stage;
                 }
             }
-            result.stages[id] = original;
+            for(auto member:g.units[u]) result.stages[member] = original;
         }
         if (best_node == kInvalidNodeId) break;
-        result.stages[best_node] = best_stage; current = std::move(best);
+        for(auto member:g.units[g.unit_of[best_node]]) result.stages[member] = best_stage;
+        current = std::move(best);
     }
     result.report = current;
     result.report.baseline_delay = before.final_delay;
@@ -396,6 +442,12 @@ Program build(const beir::Program& program, const Options& options) {
         }
         addDebugMessage(s.debug, "pipeline computation stage " + std::to_string(result.stages[id]));
     }
+    for (auto& r : rtl.arithmetic_regions) {
+        auto at=result.stages[r.outputs.front()];
+        for(auto& v:r.inputs) if(v.kind==OperandKind::Symbol && !g.constant[v.node])
+            v.node=delayed[v.node].at(static_cast<std::size_t>(at-result.stages[v.node]));
+    }
+    if(!rtl.arithmetic_regions.empty()) beir::regions::validate(rtl);
     // Drop dead computations, preserving dense IDs and debug identities.
     for (const auto& original : program.signals)
         if (!g.live[original.id]) rtl.signal(original.id).driver.reset();
@@ -417,6 +469,17 @@ Program build(const beir::Program& program, const Options& options) {
 
 void validateProgram(const Program& p) {
     validateOptions(p.options);
+    if (p.combinational.arithmetic_regions.size() != p.rtl_program.arithmetic_regions.size())
+        throw std::runtime_error("pipeline: region metadata count changed");
+    if (!p.rtl_program.arithmetic_regions.empty()) {
+        beir::regions::validate(p.combinational);
+        beir::regions::validate(p.rtl_program);
+        for(std::size_t i=0;i<p.combinational.arithmetic_regions.size();++i) {
+            const auto& a=p.combinational.arithmetic_regions[i];const auto& b=p.rtl_program.arithmetic_regions[i];
+            if(a.id!=b.id || a.members!=b.members || a.outputs!=b.outputs)
+                throw std::runtime_error("pipeline: region identities or membership changed");
+        }
+    }
     if (!p.options.register_stages) return;
     Graph g(p.combinational, p.options);
     if (p.stages.size() != p.combinational.signals.size() ||

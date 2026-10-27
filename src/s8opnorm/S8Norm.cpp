@@ -1004,6 +1004,7 @@ Value normalizeCast(Context& ctx,
 S8Type hardwareRawType(const S7Operation& op, S8Type target_type,
                        const std::vector<S8Operand>& operands) {
     switch (op.hardware_op) {
+    case S7HardwareOp::F32MulRNE:
     case S7HardwareOp::AddCarry:
         return target_type;
     case S7HardwareOp::ZExt:
@@ -1044,6 +1045,7 @@ void checkArity(const S7Operation& op, std::size_t actual, std::size_t expected)
 S8OpKind convertHardwareKind(S7HardwareOp op) {
     switch (op) {
     case S7HardwareOp::AddCarry: return S8OpKind::AddCarry;
+    case S7HardwareOp::F32MulRNE: return S8OpKind::F32MulRNE;
     case S7HardwareOp::ZExt: return S8OpKind::ZExt;
     case S7HardwareOp::SExt: return S8OpKind::SExt;
     case S7HardwareOp::Trunc: return S8OpKind::Trunc;
@@ -1073,6 +1075,12 @@ Value normalizeHardware(Context& ctx,
     for (const auto& operand : op.operands) operands.push_back(normalizeOperand(ctx, operand));
 
     switch (op.hardware_op) {
+    case S7HardwareOp::F32MulRNE:
+        checkArity(op, operands.size(), 2);
+        rejectSignedView("F32MulRNE", operands, op.debug_loc);
+        if (target_type.width != 37 || operands[0].type.width != 32 || operands[1].type.width != 32)
+            fail("F32MulRNE interface must be uint32,uint32 -> uint37", op.debug_loc);
+        break;
     case S7HardwareOp::AddCarry:
         checkArity(op, operands.size(), 3);
         rejectSignedView("AddCarry", operands, op.debug_loc);
@@ -1380,6 +1388,7 @@ std::string opName(S8OpKind kind) {
     switch (kind) {
     case S8OpKind::AssignCast: return "AssignCast";
     case S8OpKind::AddCarry: return "AddCarry";
+    case S8OpKind::F32MulRNE: return "F32MulRNE";
     case S8OpKind::Add: return "Add";
     case S8OpKind::Sub: return "Sub";
     case S8OpKind::Mul: return "Mul";

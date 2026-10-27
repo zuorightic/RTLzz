@@ -3,6 +3,7 @@
 #include "backend/pipeline_valid.hpp"
 
 #include "backend/beopt.hpp"
+#include "backend/arithmetic_regions.hpp"
 #include "backend/circt_bridge.hpp"
 #include "backend/rtlgen.hpp"
 #include "debug/RTLZZException.h"
@@ -555,6 +556,23 @@ PipelineResult compile(const PipelineConfig& config) {
                         "RTLzz backend optimization: " + message);
                 }
             });
+        bool has_fp = false;
+        for (const auto& s : beir_program.signals)
+            if (s.driver && s.driver->kind == beir::OperationKind::F32MulRNE) has_fp = true;
+        if (has_fp) {
+            PipelineConfig impl;
+            impl.source_name = "arithmetic_fp32_template.logic.cpp";
+            impl.source_text = "#include \"arithmetic.hpp\"\nInt<32> a,b; Int<37> y;\n#pragma input_port a\n#pragma input_port b\n#pragma output_port y\nvoid arithmetic_fp32_template() { y = vularith::F32MulRNEBody(a,b); }\n";
+            impl.top_function = "arithmetic_fp32_template";
+            impl.clang_args = config.clang_args;
+            impl.output_kind = OutputKind::Beir;
+            auto compiled = compile(impl);
+            if (!compiled.ok() || !compiled.beir_program)
+                throw std::runtime_error("FP32 template compilation failed: " + compiled.error + "\n" + compiled.error_debug_text);
+            beir_program = beir::regions::expandF32(std::move(beir_program), *compiled.beir_program);
+            beir_program = beir::opt::optimizeProgram(std::move(beir_program), optimization_options);
+            beir::regions::validate(beir_program);
+        }
         current_debug_text = [&beir_program]() {
             return "latest successful stage: beir-opt\n" + beir::emitText(beir_program);
         };

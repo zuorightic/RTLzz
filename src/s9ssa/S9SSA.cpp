@@ -1,6 +1,7 @@
 #include "s9ssa/S9SSA.h"
 
 #include <algorithm>
+#include <functional>
 #include <deque>
 #include <map>
 #include <set>

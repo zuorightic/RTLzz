@@ -1,4 +1,5 @@
 #include "backend/beir.hpp"
+#include "backend/arithmetic_regions.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -296,6 +297,7 @@ static const char* operationKindText(OperationKind kind) {
     case OperationKind::Assign: return "assign";
     case OperationKind::PortRead: return "port_read";
     case OperationKind::AddCarry: return "add_carry";
+    case OperationKind::F32MulRNE: return "fp32_mul_rne_marker";
     case OperationKind::Binary: return "binary";
     case OperationKind::Unary: return "unary";
     case OperationKind::ArrayAccess: return "array_access";
@@ -1250,6 +1252,10 @@ void MutableProgram::analyzeValueFacts() {
 
 void MutableProgram::rebuildObservableIds() {
     observable_ids_.clear();
+    for (const auto& region : program_.arithmetic_regions) {
+        for (auto id : region.outputs) observable_ids_.insert(id);
+        for (const auto& v : region.inputs) if (v.kind == OperandKind::Symbol) observable_ids_.insert(v.node);
+    }
     for (const auto& signal : program_.signals) {
         if (!signal.port_name.empty()) observable_ids_.insert(signal.id);
     }
@@ -1264,6 +1270,7 @@ void MutableProgram::rebuildObservableIds() {
 }
 
 bool MutableProgram::isCseCandidate(const Operation& op) const {
+    if (op.kind == OperationKind::F32MulRNE) return false;
     if (op.kind == OperationKind::Assign || op.kind == OperationKind::PortRead) return false;
     if (op.kind == OperationKind::DynamicWriteSlice ||
         op.kind == OperationKind::DynamicWriteBit ||
@@ -1374,6 +1381,14 @@ bool MutableProgram::replaceAliases(const std::unordered_map<NodeId, Operand>& a
             signal.debug = signal.driver->debug;
         }
     }
+    bool region_inputs_changed = false;
+    for (auto& region : program_.arithmetic_regions) for (auto& input : region.inputs) {
+        auto resolved = resolveOperand(input, aliases);
+        if (!(operandSignature(resolved) == operandSignature(input))) {
+            input = std::move(resolved); changed = true; region_inputs_changed = true;
+        }
+    }
+    if (region_inputs_changed) rebuildObservableIds();
     if (changed) markValueFactsDirty();
     return changed;
 }
@@ -1416,6 +1431,18 @@ void MutableProgram::compact(const std::unordered_set<NodeId>& live) {
     };
 
     for (auto& port : program_.ports) remap_node_list(port.element_nodes);
+    for (auto& r : program_.arithmetic_regions) {
+        auto require_boundary = [&](NodeId id) {
+            if (id >= remap.size() || remap[id] == kInvalidNodeId)
+                throw std::runtime_error("arithmetic region boundary removed without an explicit replacement");
+        };
+        for (const auto& v : r.inputs) if (v.kind == OperandKind::Symbol) require_boundary(v.node);
+        for (auto id : r.outputs) require_boundary(id);
+        for (auto& v : r.inputs) remapOperand(v, remap);
+        remap_node_list(r.outputs);
+        remap_node_list(r.members);
+        for (auto& cut : r.legal_cut_groups) remap_node_list(cut);
+    }
 
     for (auto& signal : compacted) {
         remapDebug(signal.debug, remap);
@@ -1600,6 +1627,7 @@ static void emitOperation(std::ostream& os, const Program& program, const Operat
 std::string emitText(const Program& program) {
     std::ostringstream os;
     os << "beir v1\n";
+    if (!program.arithmetic_regions.empty()) os << regions::report(program);
     os << "function " << program.function_name << "\n";
     os << "inputs ";
     emitNameList(os, program.inputs);

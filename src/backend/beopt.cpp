@@ -1,4 +1,5 @@
 #include "backend/beopt.hpp"
+#include "backend/arithmetic_regions.hpp"
 
 #include "backend/beopt_algebraic.hpp"
 #include "backend/beopt_assign_chains.hpp"
@@ -103,6 +104,8 @@ Options parseOptions(const std::vector<std::string>& values) {
 Program optimizeProgram(Program program,
                         const Options& options,
                         const IterationCallback& iteration_callback) {
+    if (!program.arithmetic_regions.empty())
+        return regions::optimizeAtomic(std::move(program), options, iteration_callback);
     MutableProgram graph(std::move(program));
     const int iter_before_predicate_sinking = options.max_iterations > 8 ? 4 : std::max(1, options.max_iterations / 2);
     for (int iteration = 1; iteration <= options.max_iterations; ++iteration) {

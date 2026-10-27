@@ -54,6 +54,7 @@ enum class BinaryOp {
 
 enum class HardwareOp {
     AddCarry,
+    F32MulRNE,
     ZExt,
     SExt,
     Trunc,

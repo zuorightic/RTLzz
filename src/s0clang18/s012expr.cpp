@@ -551,6 +551,7 @@ ExprBuildResult buildFixintMemberCallExpr(const ExprBuildContext& context,
 
 bool isFixintFreeAPI(const clang::FunctionDecl* callee, std::string& api) {
     api = canonicalApiName(unqualifiedName(callee));
+    if (callee && callee->getQualifiedNameAsString() == "vularith::F32MulRNE")  { api = "__rtlzz_fp32_mul_rne"; return true; }
     return api == "AddCarry" ||
            api == "Cat" || api == "cat" || api == "concat" ||
            api == "Repeat" || api == "repeat" ||

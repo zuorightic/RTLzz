@@ -87,6 +87,7 @@ struct S8Operand {
 enum class S8OpKind {
     AssignCast,
     AddCarry,
+    F32MulRNE,
     Add,
     Sub,
     Mul,

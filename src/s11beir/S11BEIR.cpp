@@ -89,6 +89,7 @@ std::string opKindName(S10OpKind kind) {
     switch (kind) {
     case S10OpKind::AssignCast: return "assign_cast";
     case S10OpKind::AddCarry: return "add_carry";
+    case S10OpKind::F32MulRNE: return "fp32_mul_rne";
     case S10OpKind::Add: return "add";
     case S10OpKind::Sub: return "sub";
     case S10OpKind::Mul: return "mul";
@@ -193,6 +194,7 @@ struct Builder {
     std::unordered_map<SymbolId, beir::NodeId> output_nodes_by_symbol;
     std::unordered_map<SymbolId, S10ValueId> input_initial_by_symbol;
     std::unordered_set<std::string> used_names;
+    std::uint64_t arithmetic_occurrence = 0;
     int generated_nodes = 0;
 
     explicit Builder(const S10PredicateProgram& program, BEIROptions opts)
@@ -651,6 +653,10 @@ struct Builder {
 
         if (source.kind == S10OpKind::AssignCast) {
             op.kind = beir::OperationKind::Cast;
+        } else if (source.kind == S10OpKind::F32MulRNE) {
+            op.kind = beir::OperationKind::F32MulRNE;
+            op.arithmetic_origin = output.function_name + "/fp32_mul_rne/" +
+                std::to_string(arithmetic_occurrence++);
         } else if (source.kind == S10OpKind::AddCarry) {
             op.kind = beir::OperationKind::AddCarry;
         } else if (isBinaryKind(source.kind)) {

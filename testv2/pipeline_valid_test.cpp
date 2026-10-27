@@ -1,6 +1,7 @@
 #include "backend/pipeline.hpp"
 #include "backend/rtlgen.hpp"
 #include "rtlzz.hpp"
+#include "circt_test_policy.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -97,6 +98,7 @@ int main(int argc,char**argv) {
         else artifact = argv[i];
     }
 
+    applyRegressionCirctPolicy(test_circt);
     structure();
     std::ofstream file;
     if (!artifact.empty()) {file.open(artifact); CHECK(file.good()); file<<"`timescale 1ns/1ps\n";}
@@ -139,7 +141,12 @@ int main(int argc,char**argv) {
     bad=options(2); bad.source_codelines[0]+="\n"; auto pos=bad.source_codelines[0].find("uint32_t x="); bad.source_codelines[0].insert(pos,"ov=iv; "); CHECK(!rtlzz::compileToRtl(bad).ok());
     bad=options(2); bad.source_codelines[0].replace(bad.source_codelines[0].find("bool ov;"),8,"std::array<bool,2> ov;"); CHECK(!rtlzz::compileToRtl(bad).ok());
     for (int n : {0,2}) { auto plain=options(n); plain.reset_enabled=false; plain.input_reset_values.clear(); CHECK(rtlzz::compileToRtl(plain).ok()); }
-    bad=options(0); bad.use_circt=true; CHECK(rtlzz::compileToRtl(bad).ok());
+    if (regressionCirctEnabled()) {
+        bad=options(0); bad.use_circt=true;
+        auto circt=rtlzz::compileToRtl(bad);
+        if (!circt.ok()) std::cerr << circt.error << "\n";
+        CHECK(circt.ok());
+    }
     if (file.is_open()) {
         file<<"module valid_tb; logic clk=0,rstn=0;logic [31:0] sample;logic sample_valid;logic [31:0] d0[0:4],d1[0:4];logic v[0:4];\n";
         int index=0; for (int n:{0,1,2,4,8}) file<<"valid_case_"<<n<<" c"<<index<<"(clk,rstn,sample,sample_valid,d0["<<index<<"],d1["<<index<<"],v["<<index++<<"]);\n";

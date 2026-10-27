@@ -1039,6 +1039,9 @@ private:
                 std::string value =
                     "(" + binaryOperand(ops[0], signed_context) + " " + sv_op + " " +
                     binaryOperand(ops[1], signed_context) + ")";
+                if ((op.op == beir::OpCode::Add || op.op == beir::OpCode::Sub) &&
+                    widthOf(op.type) < std::max(widthOf(ops[0].type), widthOf(ops[1].type)))
+                    return std::to_string(widthOf(op.type)) + "'(" + value + ")";
                 if (op.op != beir::OpCode::Shl && op.op != beir::OpCode::Shr) {
                     return value;
                 }
