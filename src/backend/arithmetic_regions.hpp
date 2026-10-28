@@ -7,6 +7,7 @@ namespace pred::beir::regions {
 // rejected: arbitrary shared internals are never renamed to region inputs.
 Program expandF32(Program program, const Program& implementation);
 void validate(const Program& program);
+std::vector<std::vector<NodeId>> schedulingGroups(const Program& program);
 Program optimizeAtomic(Program program, const opt::Options& options,
                        const opt::IterationCallback& callback = {});
 std::string report(const Program& program);

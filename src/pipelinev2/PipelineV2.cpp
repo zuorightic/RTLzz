@@ -4,6 +4,7 @@
 
 #include "backend/beopt.hpp"
 #include "backend/arithmetic_regions.hpp"
+#include "backend/mul_split.hpp"
 #include "backend/circt_bridge.hpp"
 #include "backend/rtlgen.hpp"
 #include "debug/RTLZZException.h"
@@ -580,6 +581,10 @@ PipelineResult compile(const PipelineConfig& config) {
             return rtlgen::collectDebugSignals(beir_program, "");
         };
 
+        if (!config.arithmetic_candidate.empty() && config.arithmetic_candidate != "original") {
+            if(config.arithmetic_candidate != "mul32_split16") throw std::runtime_error("unknown arithmetic candidate");
+            beir_program = beir::mul_split::expand32(std::move(beir_program));
+        }
         PipelineResult result;
         if (config.pipeline && (config.pipeline->register_stages > 0 || config.pipeline->reset_enabled || !config.pipeline->input_valid_name.empty())) {
             if (config.progress_callback) config.progress_callback("RTLzz pipeline scheduling and register materialization");

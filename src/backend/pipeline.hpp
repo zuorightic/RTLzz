@@ -13,6 +13,7 @@ namespace pred::pipeline {
 // directly in CompileOptions. rtlzz.cpp translates between the two layers.
 struct Options {
     int register_stages = 0;
+    bool use_simple_cost = false;
     std::string clock_name = "clk";
     std::map<rtlzz::PipelineOperation, double> operation_delay_weights;
     double timing_relaxation_ratio = 0.05;
@@ -52,6 +53,10 @@ struct Program {
 void initializeResetValues(Program& program);
 void validateOptions(const Options& options);
 Program build(const beir::Program& program, const Options& options);
+// Uses the same group placement as build; a diagnostic identifies the failed
+// group, cap, legal stage interval and observed arrival. Cap uses provider units.
+bool feasibleSchedule(const beir::Program& program, const Options& options,
+                      double cap, std::string& diagnostic);
 // Check stage, source identity, type, and register-storage invariants.
 void validateProgram(const Program& program);
 std::string emitReport(const Program& program);

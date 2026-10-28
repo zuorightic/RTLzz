@@ -30,6 +30,8 @@ struct PipelineConfig {
     std::string top_function;
     std::vector<std::string> clang_args;
     int unroll_limit = 1024;
+    // Optional deterministic arithmetic candidate expansion after BEOPT.
+    std::string arithmetic_candidate;
     std::optional<pipeline::Options> pipeline;
     // Zero means no artificial S7 leaf-symbol limit.
     std::size_t max_leaf_symbols = 0;

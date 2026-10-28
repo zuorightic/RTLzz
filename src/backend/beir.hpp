@@ -197,11 +197,17 @@ struct ArithmeticRegion {
     std::string semantics = "binary32-rne-tininess-after-canonicalNaN-v1";
     std::string template_version = "softfloat3d-bitvector-mul-v1";
     std::string sharing_policy = "semantic-marker-and-isolated-BEOPT-v1";
+    // Step4 floating-point regions remain atomic. Step5 integer templates may
+    // opt into declared legal groups; only those groups can be split.
+    bool internal_split_enabled = false;
+    std::string split_version;
     std::vector<Operand> inputs;
     std::vector<NodeId> outputs;
     std::vector<NodeId> members;
-    // No internal split is enabled in step4, for any experiment group.
     std::vector<std::vector<NodeId>> legal_cut_groups;
+    // Sequential nodes inserted at legal internal cuts, populated only by
+    // pipeline materialization. They are not combinational scheduling members.
+    std::vector<NodeId> internal_registers;
 };
 
 struct Program {

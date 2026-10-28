@@ -34,9 +34,33 @@ std::vector<int> owners(const Program& p) {
         const auto& r=p.arithmetic_regions[i];
         if(r.id.empty() || !ids.insert(r.id).second) bad("empty or duplicate stable identity");
         if(r.members.empty() || r.outputs.empty()) bad("empty members or exits: "+r.id);
-        if(!r.legal_cut_groups.empty()) bad("internal cuts are not enabled in atomic v1");
+        if(!r.internal_split_enabled && !r.legal_cut_groups.empty())
+            bad("internal cuts are not enabled for this atomic region");
+        if (r.internal_split_enabled && (r.operation != "mul_u32_full64" || r.split_version != "partial-middle-high-groups-v1"))
+            bad("unsupported internal split policy");
+        if (r.internal_split_enabled && r.legal_cut_groups.empty())
+            bad("split-enabled region has no legal groups");
+        std::set<NodeId> grouped;
+        for (const auto& group : r.legal_cut_groups) {
+            if (group.empty()) bad("empty legal split group");
+            for (auto id : group) {
+                if (!std::count(r.members.begin(), r.members.end(), id))
+                    bad("legal split group contains a non-member");
+                if (!grouped.insert(id).second) bad("overlapping legal split groups");
+            }
+        }
+        if (r.internal_split_enabled && grouped.size() != r.members.size())
+            bad("legal split groups do not cover all members");
         for(auto id:r.members) {
             if(id>=o.size() || o[id]) bad("invalid, duplicate or overlapping member");
+            o[id]=static_cast<int>(i)+1;
+        }
+        if(!r.internal_split_enabled && !r.internal_registers.empty()) bad("internal registers in atomic region");
+        for(auto id:r.internal_registers) {
+            if(id>=o.size() || o[id]) bad("invalid or overlapping internal register");
+            const auto& s=p.signal(id);
+            if(!s.driver || s.driver->kind!=OperationKind::Assign || s.driver->operands.size()!=1)
+                bad("malformed internal register driver");
             o[id]=static_cast<int>(i)+1;
         }
     }
@@ -53,6 +77,14 @@ void dag(const std::vector<std::set<NodeId>>& edges) {
     }
     if(count!=edges.size()) bad("cyclic graph or external path through contracted region");
 }
+}
+std::vector<std::vector<NodeId>> schedulingGroups(const Program& p) {
+    std::vector<std::vector<NodeId>> groups;
+    for(const auto& r:p.arithmetic_regions) {
+        if(r.internal_split_enabled) groups.insert(groups.end(),r.legal_cut_groups.begin(),r.legal_cut_groups.end());
+        else groups.push_back(r.members);
+    }
+    return groups;
 }
 void validate(const Program& p) {
     auto o=owners(p);
@@ -93,6 +125,18 @@ void validate(const Program& p) {
         if(id>=o.size() || o[id]) bad("invalid public port boundary");
     }
     dag(edges); dag(contracted);
+    // A partition may create a cycle even when the original node DAG is legal.
+    std::vector<NodeId> group_of(p.signals.size(), kInvalidNodeId);
+    NodeId group_count=0;
+    for(const auto& group:schedulingGroups(p)) {
+        for(auto id:group) group_of[id]=group_count;
+        ++group_count;
+    }
+    for(auto& id:group_of) if(id==kInvalidNodeId) id=group_count++;
+    std::vector<std::set<NodeId>> group_edges(group_count);
+    for(NodeId source=0;source<edges.size();++source) for(auto user:edges[source])
+        if(group_of[source]!=group_of[user]) group_edges[group_of[source]].insert(group_of[user]);
+    dag(group_edges);
 }
 
 Program expandF32(Program p, const Program& implementation) {
@@ -137,7 +181,10 @@ Program expandF32(Program p, const Program& implementation) {
 }
 
 Program optimizeAtomic(Program p,const opt::Options& options,const opt::IterationCallback& callback) {
-    validate(p);auto owner=owners(p);
+    validate(p);
+    for(const auto& r:p.arithmetic_regions) if(r.internal_split_enabled)
+        bad("split templates require boundary-preserving DCE/facts cleanup; generic BEOPT rejected");
+    auto owner=owners(p);
     // Optimize disjoint components with explicit import/export ports. Synthetic
     // aliases keep semantic exits present even when their values become literals.
     std::vector<std::set<NodeId>> exports(p.arithmetic_regions.size()+1);
@@ -226,10 +273,12 @@ std::string report(const Program& p) {
     std::ostringstream os;os<<"arithmetic-regions atomic-v1 count="<<p.arithmetic_regions.size()<<"\n";
     for(const auto& r:p.arithmetic_regions) {
         os<<"region "<<r.id<<" operation="<<r.operation<<" semantics="<<r.semantics<<" template="<<r.template_version
-          <<" sharing="<<r.sharing_policy<<" restoration_clones=0 cuts=0 members="<<r.members.size()<<" inputs=";
+          <<" sharing="<<r.sharing_policy<<" split="<<(r.internal_split_enabled?"enabled":"disabled")
+          <<" split_version="<<r.split_version<<" restoration_clones=0 cuts="<<r.legal_cut_groups.size()<<" members="<<r.members.size()<<" inputs=";
         for(const auto& v:r.inputs) os<<(v.kind==OperandKind::Symbol?"#"+std::to_string(v.node):"literal")<<",";
         os<<" outputs=";for(auto id:r.outputs) os<<"#"<<id<<",";os<<"\n";
         os<<"  member_ids=";for(auto id:r.members) os<<"#"<<id<<",";os<<"\n";
+        os<<"  internal_register_ids=";for(auto id:r.internal_registers) os<<"#"<<id<<",";os<<"\n";
     }return os.str();
 }
 }

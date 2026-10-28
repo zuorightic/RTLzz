@@ -1442,6 +1442,7 @@ void MutableProgram::compact(const std::unordered_set<NodeId>& live) {
         remap_node_list(r.outputs);
         remap_node_list(r.members);
         for (auto& cut : r.legal_cut_groups) remap_node_list(cut);
+        remap_node_list(r.internal_registers);
     }
 
     for (auto& signal : compacted) {

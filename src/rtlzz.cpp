@@ -136,6 +136,8 @@ CompileResult compileSource(const CompileOptions& options, OutputKind output_kin
     config.unroll_limit = options.unroll_limit;
     config.pipeline.emplace();
     config.pipeline->register_stages = options.register_stages;
+    config.pipeline->use_simple_cost = options.use_simple_cost;
+    config.arithmetic_candidate = options.arithmetic_candidate;
     config.pipeline->clock_name = options.clock_name;
     config.pipeline->input_valid_name = options.input_valid_name;
     config.pipeline->output_valid_name = options.output_valid_name;

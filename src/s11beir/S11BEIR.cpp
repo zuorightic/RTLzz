@@ -195,6 +195,7 @@ struct Builder {
     std::unordered_map<SymbolId, S10ValueId> input_initial_by_symbol;
     std::unordered_set<std::string> used_names;
     std::uint64_t arithmetic_occurrence = 0;
+    std::uint64_t integer_occurrence = 0;
     int generated_nodes = 0;
 
     explicit Builder(const S10PredicateProgram& program, BEIROptions opts)
@@ -662,6 +663,8 @@ struct Builder {
         } else if (isBinaryKind(source.kind)) {
             op.kind = beir::OperationKind::Binary;
             op.op = binaryOp(source.kind);
+            if (op.op == beir::OpCode::Mul)
+                op.arithmetic_origin = output.function_name + "/mul/" + std::to_string(integer_occurrence++);
         } else if (isUnaryKind(source.kind)) {
             op.kind = beir::OperationKind::Unary;
             op.op = unaryOp(source.kind);

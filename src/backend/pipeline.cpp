@@ -1,5 +1,6 @@
 #include "backend/pipeline.hpp"
 #include "backend/arithmetic_regions.hpp"
+#include "backend/simple_cost.hpp"
 #include "backend/rtl_names.hpp"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <cctype>
 #include <limits>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -90,14 +92,18 @@ struct Graph {
     std::vector<std::vector<NodeId>> users;
     std::vector<bool> live, input, output, constant;
     std::vector<double> costs;
+    std::vector<std::uint64_t> areas;
     std::vector<NodeId> unit_order, unit_of;
     std::vector<std::vector<NodeId>> units;
+    std::vector<std::string> unit_labels;
 
     Graph(const beir::Program& program, const Options& options)
         : p(program), last(options.register_stages), users(p.signals.size()),
           live(p.signals.size()), input(live.size()), output(live.size()),
-          constant(live.size()), costs(live.size()) {
+          constant(live.size()), costs(live.size()), areas(live.size()) {
         if (!p.arithmetic_regions.empty()) beir::regions::validate(p);
+        for(const auto& r:p.arithmetic_regions) if(!r.internal_registers.empty())
+            throw std::runtime_error("pipeline: cannot schedule materialized region registers");
         if (!options.input_valid_name.empty()) {
             for (const auto& port : p.ports) {
                 if (port.name != options.input_valid_name && port.name != options.output_valid_name) continue;
@@ -157,11 +163,21 @@ struct Graph {
             for (auto user : users[id]) if (!--indegree[user]) ready.push(user);
         }
         if (order.size() != count) throw std::runtime_error("pipeline: cyclic dependency graph");
-        unit_of.resize(live.size()); units.resize(live.size());
-        for (NodeId id=0; id<live.size(); ++id) unit_of[id]=id;
+        unit_of.resize(live.size()); units.resize(live.size());unit_labels.resize(live.size());
+        for (NodeId id=0; id<live.size(); ++id) {unit_of[id]=id;unit_labels[id]="node#"+std::to_string(id);}
         for (const auto& r:p.arithmetic_regions) {
-            auto representative=*std::min_element(r.members.begin(),r.members.end());
-            for(auto id:r.members) unit_of[id]=representative;
+            if (r.internal_split_enabled) {
+                unsigned group_index=0;
+                for (const auto& group : r.legal_cut_groups) {
+                    auto representative=*std::min_element(group.begin(),group.end());
+                    unit_labels[representative]=r.id+"/group"+std::to_string(group_index++);
+                    for(auto id:group) unit_of[id]=representative;
+                }
+            } else {
+                auto representative=*std::min_element(r.members.begin(),r.members.end());
+                unit_labels[representative]=r.id+"/atomic";
+                for(auto id:r.members) unit_of[id]=representative;
+            }
         }
         for(auto id:order) units[unit_of[id]].push_back(id);
         std::vector<std::unordered_set<NodeId>> unit_users(live.size());
@@ -186,16 +202,23 @@ struct Graph {
             for (const auto& v : op.operands)
                 if (v.kind != OperandKind::Literal &&
                     (v.kind != OperandKind::Symbol || !constant[v.node])) constant[id] = false;
+            const auto simple = options.use_simple_cost ? simple_cost::node(p,id) : simple_cost::Cost{};
             if (constant[id]) continue;
             auto k = key(op);
-            auto it = options.operation_delay_weights.find(k);
-            costs[id] = it != options.operation_delay_weights.end() ? it->second
-                : k == Key::Assign ? 0 : k == Key::Multiply ? 3 : 1;
+            if (options.use_simple_cost) {
+                const auto cost = simple;
+                costs[id] = static_cast<double>(cost.delay);
+                areas[id] = cost.area;
+            } else {
+                auto it = options.operation_delay_weights.find(k);
+                costs[id] = it != options.operation_delay_weights.end() ? it->second
+                    : k == Key::Assign ? 0 : k == Key::Multiply ? 3 : 1;
+            }
         }
     }
 
     // Earliest feasible placement under a cost cap, with output sinks fixed at N.
-    bool schedule(double cap, std::vector<int>& stage) const {
+    bool schedule(double cap, std::vector<int>& stage, std::string* diagnostic=nullptr) const {
         stage.assign(live.size(), 0);
         std::vector<double> arrival(live.size());
         for(auto u:unit_order) {
@@ -207,6 +230,7 @@ struct Graph {
             }
             if(fixed) start=last;
             bool placed=false;
+            double peak=0;
             for(int at=start;at<=last && at<=start+1;++at) {
                 bool fits=true;
                 for(auto id:units[u]) {
@@ -217,12 +241,17 @@ struct Graph {
                     for(const auto& v:p.signal(id).driver->operands)
                         if(v.kind==OperandKind::Symbol && !constant[v.node] && stage[v.node]==at)
                             a=std::max(a,arrival[v.node]);
-                    arrival[id]=a+costs[id]; if(arrival[id]>cap) fits=false;
+                    arrival[id]=a+costs[id];peak=std::max(peak,arrival[id]);if(arrival[id]>cap) fits=false;
                 }
                 if(fits) {placed=true;break;}
                 if(fixed) break;
             }
-            if(!placed) return false;
+            if(!placed) {
+                if(diagnostic) *diagnostic="group="+unit_labels[u]+" legal_stages="+std::to_string(start)+".."+
+                    std::to_string(last)+" N="+std::to_string(last)+" cap="+std::to_string(cap)+
+                    " observed_arrival="+std::to_string(peak)+"; group cannot be cut internally";
+                return false;
+            }
         }
         return true;
     }
@@ -253,6 +282,9 @@ struct Graph {
         }
         for (auto id : order) {
             if (constant[id]) continue;
+            if (!input[id] && areas[id] > UINT64_MAX - r.combinational_cost)
+                throw std::runtime_error("pipeline: combinational cost overflow");
+            if(!input[id]) r.combinational_cost += areas[id];
             int end = stage[id];
             for (auto user : users[id]) end = std::max(end, stage[user]);
             if (id == valid_input) end = last; // Dedicated chain, independent of data consumers.
@@ -263,11 +295,21 @@ struct Graph {
             r.register_bits += width * length;
             r.register_count += static_cast<std::size_t>(length);
         }
+        if(p.signals.size() && !areas.empty() && std::any_of(areas.begin(),areas.end(),[](auto a){return a!=0;})) r.cost_model="simple-cost-v1.1/effective-width-v2";
         r.final_delay = *std::max_element(r.stage_delays.begin(), r.stage_delays.end());
         return r;
     }
 };
 } // namespace
+
+bool feasibleSchedule(const beir::Program& p,const Options& o,double cap,std::string& diagnostic) {
+    validateOptions(o);
+    if(!std::isfinite(cap) || cap<0) throw std::runtime_error("pipeline: invalid feasibility cap");
+    auto normalized=p;
+    if(o.use_simple_cost) {beir::MutableProgram graph(normalized);graph.ensureValueFacts();normalized=graph.finish();}
+    Graph graph(normalized,o);std::vector<int> stages;diagnostic.clear();
+    return graph.schedule(cap,stages,&diagnostic);
+}
 
 void validateOptions(const Options& o) {
     if (o.register_stages < 0 || o.register_stages == std::numeric_limits<int>::max())
@@ -299,12 +341,30 @@ void validateOptions(const Options& o) {
 
 Program build(const beir::Program& program, const Options& options) {
     validateOptions(options);
+    beir::Program normalized = program;
+    if (options.use_simple_cost) {
+        beir::MutableProgram facts(normalized);
+        facts.ensureValueFacts();
+        normalized = facts.finish();
+    }
     Program result;
     result.options = options;
-    result.combinational = program;
-    result.rtl_program = program;
-    if (!options.register_stages && !options.reset_enabled && options.input_valid_name.empty()) return result;
-    Graph g(program, options);
+    if (options.use_simple_cost) result.report.cost_model = "simple-cost-v1.1/effective-width-v2";
+    result.combinational = normalized;
+    result.rtl_program = normalized;
+    if (!options.register_stages && !options.reset_enabled && options.input_valid_name.empty()) {
+        if(!normalized.arithmetic_regions.empty()) beir::regions::validate(normalized);
+        if(options.use_simple_cost) {
+            Graph graph(normalized,options);
+            result.stages.assign(normalized.signals.size(),0);
+            result.report=graph.evaluate(result.stages);
+            result.report.baseline_delay=result.report.final_delay;
+            result.report.allowed_delay=result.report.final_delay*105.0/100.0;
+            result.report.cost_model="simple-cost-v1.1/effective-width-v2";
+        }
+        return result;
+    }
+    Graph g(normalized, options);
     if (g.valid_input != kInvalidNodeId) result.valid_nodes.push_back(g.valid_input);
     auto connect_valid_output = [&]() {
         if (result.valid_nodes.empty()) return;
@@ -333,7 +393,7 @@ Program build(const beir::Program& program, const Options& options) {
     }
     if (!std::isfinite(upper)) throw std::runtime_error("pipeline: delay sum overflow");
     std::vector<int> baseline;
-    if (!g.schedule(upper, baseline)) throw std::runtime_error("pipeline: no feasible schedule");
+    if (!g.schedule(upper, baseline)) throw std::runtime_error("pipeline: no feasible schedule for declared groups at N="+std::to_string(g.last));
     // Monotonic earliest-stage feasibility; keep the feasible upper endpoint.
     for (int i = 0; i < 64 && lower < upper; ++i) {
         double middle = lower + (upper - lower) / 2;
@@ -344,9 +404,11 @@ Program build(const beir::Program& program, const Options& options) {
     }
     result.stages = baseline;
     auto before = g.evaluate(baseline);
-    const double allowed = before.final_delay * (1 + options.timing_relaxation_ratio);
+    const double allowed = options.use_simple_cost ? before.final_delay*105.0/100.0
+        : before.final_delay * (1 + options.timing_relaxation_ratio);
     if (!std::isfinite(allowed)) throw std::runtime_error("pipeline: timing allowance overflow");
     auto current = before;
+    std::size_t accepted_group_moves = 0;
     for (;;) {
         auto best = current;
         NodeId best_node = kInvalidNodeId;
@@ -372,14 +434,17 @@ Program build(const beir::Program& program, const Options& options) {
         if (best_node == kInvalidNodeId) break;
         for(auto member:g.units[g.unit_of[best_node]]) result.stages[member] = best_stage;
         current = std::move(best);
+        ++accepted_group_moves;
     }
     result.report = current;
     result.report.baseline_delay = before.final_delay;
     result.report.allowed_delay = allowed;
     result.report.baseline_register_bits = before.register_bits;
+    result.report.accepted_group_moves = accepted_group_moves;
+    if(options.use_simple_cost) result.report.cost_model="simple-cost-v1.1/effective-width-v2";
 
     auto& rtl = result.rtl_program;
-    std::vector<std::vector<NodeId>> delayed(program.signals.size());
+    std::vector<std::vector<NodeId>> delayed(normalized.signals.size());
     std::unordered_set<std::string> names;
     for (const auto& port : rtl.ports) names.insert(rtl_names::sanitizeIdentifier(port.name));
     for (const auto& s : rtl.signals) names.insert(rtl_names::sanitizeIdentifier(s.name));
@@ -443,9 +508,26 @@ Program build(const beir::Program& program, const Options& options) {
         addDebugMessage(s.debug, "pipeline computation stage " + std::to_string(result.stages[id]));
     }
     for (auto& r : rtl.arithmetic_regions) {
-        auto at=result.stages[r.outputs.front()];
-        for(auto& v:r.inputs) if(v.kind==OperandKind::Symbol && !g.constant[v.node])
-            v.node=delayed[v.node].at(static_cast<std::size_t>(at-result.stages[v.node]));
+        std::set<NodeId> internal(r.members.begin(),r.members.end());
+        for(auto id:r.outputs) internal.erase(id);
+        for(const auto& reg:result.registers) if(internal.count(reg.source)) {
+            if(!r.internal_split_enabled) throw std::runtime_error("pipeline: internal register in atomic region");
+            internal.insert(reg.node);r.internal_registers.push_back(reg.node);
+        }
+        auto original_inputs=r.inputs;
+        r.inputs.clear();
+        for(const auto& v:original_inputs) {
+            if(v.kind!=OperandKind::Symbol || g.constant[v.node]) {r.inputs.push_back(v);continue;}
+            std::set<NodeId> seen;
+            for(auto member:r.members) if(program.signal(member).driver)
+                for(const auto& used:program.signal(member).driver->operands)
+                    if(used.kind==OperandKind::Symbol && used.node==v.node) {
+                        auto adjusted=v;
+                        adjusted.node=delayed[v.node].at(static_cast<std::size_t>(result.stages[member]-result.stages[v.node]));
+                        if(seen.insert(adjusted.node).second) r.inputs.push_back(adjusted);
+                    }
+            if(seen.empty()) r.inputs.push_back(v);
+        }
     }
     if(!rtl.arithmetic_regions.empty()) beir::regions::validate(rtl);
     // Drop dead computations, preserving dense IDs and debug identities.
@@ -476,8 +558,19 @@ void validateProgram(const Program& p) {
         beir::regions::validate(p.rtl_program);
         for(std::size_t i=0;i<p.combinational.arithmetic_regions.size();++i) {
             const auto& a=p.combinational.arithmetic_regions[i];const auto& b=p.rtl_program.arithmetic_regions[i];
-            if(a.id!=b.id || a.members!=b.members || a.outputs!=b.outputs)
+            if(a.id!=b.id || a.operation!=b.operation || a.semantics!=b.semantics ||
+               a.template_version!=b.template_version || a.sharing_policy!=b.sharing_policy ||
+               a.internal_split_enabled!=b.internal_split_enabled || a.split_version!=b.split_version ||
+               a.members!=b.members || a.outputs!=b.outputs || a.legal_cut_groups!=b.legal_cut_groups)
                 throw std::runtime_error("pipeline: region identities or membership changed");
+            std::set<NodeId> internal(a.members.begin(),a.members.end());
+            for(auto id:a.outputs) internal.erase(id);
+            std::vector<NodeId> expected_registers;
+            for(const auto& reg:p.registers) if(internal.count(reg.source)) {
+                internal.insert(reg.node);expected_registers.push_back(reg.node);
+            }
+            if(!a.internal_registers.empty() || b.internal_registers!=expected_registers)
+                throw std::runtime_error("pipeline: region internal register ownership changed");
         }
     }
     if (!p.options.register_stages) return;
@@ -488,6 +581,7 @@ void validateProgram(const Program& p) {
     auto expected = g.evaluate(p.stages);
     if (!std::isfinite(expected.final_delay) || !std::isfinite(p.report.allowed_delay) ||
         expected.final_delay != p.report.final_delay || expected.stage_delays != p.report.stage_delays ||
+        expected.combinational_cost != p.report.combinational_cost ||
         expected.final_delay > p.report.allowed_delay ||
         expected.register_bits != p.report.register_bits || p.registers.size() != expected.register_count)
         throw std::runtime_error("pipeline: invalid schedule or register report");
@@ -558,6 +652,9 @@ std::string emitReport(const Program& p) {
        << "final delay " << p.report.final_delay << "\n"
        << "baseline register bits " << p.report.baseline_register_bits << "\n"
        << "register bits " << p.report.register_bits << "\n"
+       << "cost model " << p.report.cost_model << "\n"
+       << "abstract combinational cost " << p.report.combinational_cost << "\n"
+       << "accepted group moves " << p.report.accepted_group_moves << "\n"
        << "register count " << p.report.register_count << "\n";
     if (!p.valid_nodes.empty()) os << "valid input " << p.options.input_valid_name << " output " << p.options.output_valid_name
         << " internal registers " << p.valid_nodes.size()-1 << "\n";

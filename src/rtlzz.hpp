@@ -33,6 +33,10 @@ struct PipelineReport {
     double allowed_delay = 0;
     // Longest stage cost in the selected schedule.
     double final_delay = 0;
+    // Frozen B/C abstract report fields. Zero unless that cost provider is used.
+    std::uint64_t combinational_cost = 0;
+    std::size_t accepted_group_moves = 0;
+    std::string cost_model = "legacy-operation-weights";
     // Costs indexed from stage 0 through stage register_stages.
     std::vector<double> stage_delays;
     // Internal register storage before / after register-area optimization.
@@ -128,6 +132,8 @@ struct CompileOptions {
     // Without reset, ignore outputs until the pipeline fills. Operations are indivisible.
     // Must be non-negative.
     int register_stages = 0;
+    bool use_simple_cost = false;
+    std::string arithmetic_candidate; // empty/original or mul32_split16
     // Rising-edge clock port added only when register_stages > 0. Must be a
     // non-reserved RTL identifier without data-port/signal collisions. In
     // rtl_module_body mode, include {clock_name, external_clock} in bindings.
