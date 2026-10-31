@@ -21,8 +21,8 @@ struct ArithmeticRequest {
     int latency = 1;
     int initiation_interval = 1;
     double target_period_ps = 0;
-    // Per-template parameters are validated by the registered implementation,
-    // not silently ignored. Core original implementations need no parameters.
+    // Only diagnostic mul-template-v1 takes block_width. Automatic policies
+    // infer all widths; unknown parameters are rejected, never ignored.
     std::map<std::string, int> template_parameters;
 };
 struct ArithmeticDiagnostic {

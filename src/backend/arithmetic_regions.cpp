@@ -36,7 +36,7 @@ std::vector<int> owners(const Program& p) {
         if(r.members.empty() || r.outputs.empty()) bad("empty members or exits: "+r.id);
         if(!r.internal_split_enabled && !r.legal_cut_groups.empty())
             bad("internal cuts are not enabled for this atomic region");
-        if (r.internal_split_enabled && (r.operation != "mul_u32_full64" || r.split_version != "partial-middle-high-groups-v1"))
+        if (r.internal_split_enabled && (r.operation != "mul_unsigned" || r.template_version != "mul-block-tree-v1" || r.split_version != "partial-products-reduction-levels-v1"))
             bad("unsupported internal split policy");
         if (r.internal_split_enabled && r.legal_cut_groups.empty())
             bad("split-enabled region has no legal groups");

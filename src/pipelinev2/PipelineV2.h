@@ -31,7 +31,6 @@ struct PipelineConfig {
     std::vector<std::string> clang_args;
     int unroll_limit = 1024;
     // Optional deterministic arithmetic candidate expansion after BEOPT.
-    std::string arithmetic_candidate;
     std::optional<rtlzz::ArithmeticRequest> arithmetic_request;
     std::optional<pipeline::Options> pipeline;
     // Zero means no artificial S7 leaf-symbol limit.

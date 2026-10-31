@@ -1,20 +1,21 @@
 # Arithmetic compiler interfaces v1
 
-Step4 owns the core request, native BEIR preflight, original-template registration,
-fixed-cost provider and structured reports. Half/quarter multiplication selection
-and its full parameterized RTL acceptance are step5; offline backend inference is
-step7. Dedicated AES/Sigmoid/fixed-point profiles and arbitrary RTL import remain unsupported; an ordinary helper built from supported primitive nodes can still lower normally, without claiming application-level acceptance.
+The core request, native BEIR preflight, fixed-cost provider and reports are
+shared by original and parameterized blocked Mul templates. Step5 adds real
+partial products, reduction-level groups and C candidate selection. Offline
+backend inference remains step7. Dedicated AES/Sigmoid/fixed-point profiles and arbitrary RTL import remain unsupported; an ordinary helper built from supported primitive nodes can still lower normally, without claiming application-level acceptance.
 
 `rtlzz::CompileOptions::arithmetic_request` and
 `pipelinev2::PipelineConfig::arithmetic_request` consume `ArithmeticRequest`.
 `loadArithmeticRequest(path)` parses the same JSON used by both CLIs. Relative
 profile/table/model paths resolve against the request file. Unknown fields,
 unsupported semantic/candidate policies, malformed quantities, L/II mismatch and
-content identities fail explicitly. Core original templates infer operation
-parameters from the typed graph; nonempty request `template_parameters` is
-currently ineligible. No request implies the general RTLzz behavior. Old
-`use_simple_cost`/`arithmetic_candidate` are temporary step5 migration dependencies
-and conflict with a new request; they are never fallback paths for it.
+content identities fail explicitly. Automatic policies infer widths from the typed graph. `mul-candidates-v1`
+enumerates original/half/quarter configurations per occurrence, filters
+eligibility, deduplicates structures and takes the first K=16 before scheduling.
+`mul-template-v1` requires the single integer parameter `block_width` in 2..128
+and is a forced functional diagnostic. `core-original-v1` retains atomic Mul. No request implies the general RTLzz behavior. The superseded `use_simple_cost`/`arithmetic_candidate` public fields and old
+split16 implementation are removed. Historical evidence reads exact snapshots.
 
 ```json
 {
@@ -55,12 +56,12 @@ groups and schedule. CIRCT is opt-in; enabling it with an unavailable/failing to
 is an error. `VUL_REGRESSION_CIRCT=0` only skips CIRCT regression work and still
 runs software/native validation.
 
-The static registry currently consists of `mul-original-v1` and the existing
-`softfloat3d-bitvector-mul-v1` implementation. The former wraps each eligible
+The static registry includes `mul-original-v1`, parameterized
+`mul-block-tree-v1` and the existing `softfloat3d-bitvector-mul-v1` implementation. The former wraps each eligible
 unowned unsigned Mul in an atomic region and records operand billing widths and
 result width. Different instances have pre-BEOPT semantic occurrence identities;
 ordinary inlined helpers generate nodes, not an invented semantic registration.
-The latter expands the registered F32MulRNE semantic marker into its existing real
+The FP implementation expands the registered F32MulRNE semantic marker into its existing real
 bit-vector graph. Its value/flags exit, numerical contract and atomic boundary
 remain intact. Unregistered region versions and missing/overlapping group metadata
 are rejected. Only declared legal groups may be split by later templates.
@@ -138,3 +139,22 @@ floats or booleans into counters. Node identities and constant limb words remain
 intentional decimal strings. Only the immutable archived v1 reader interprets
 original v1 reports; no old report is rewritten. This changes serialization,
 without changing cost, stage assignment or emitted computation.
+
+`mul-block-tree-v1` slices each actual operand into blocks (including tails),
+forms full block products, concatenates exact shift zeros, and adds pairs in
+balanced reduction levels. Each add explicitly extends both operands to the
+maximum previous width plus one. The final output has the sole declared result
+truncation/extension. No lookup table of fixed 16/32/64 indices is used. A legal
+group covers the parallel partial products or one complete reduction level;
+the scheduler chooses levels, without a user register map. Template preflight
+checks product coverage and intermediate product/carry precision in addition
+to the base typed-node contract. FP regions remain indivisible.
+
+Selection reports contain every evaluated configuration, its cost, score,
+initial/final map, attempted/accepted/rejected moves and its real computation
+graph. Nonselected computation graphs have no emitted RTL (their hash is the
+empty-body hash); only the selected report/RTL is emitted and hash bound.
+`pipeline::evaluateSchedule` and `requireSchedule` reuse the actual same group
+and cost rules. A group lower bound over an explicit abstract cap reports
+`schedule_group_over_budget`; earliest-strategy failure reports
+`schedule_no_placement_found`, never an unproved L impossibility.

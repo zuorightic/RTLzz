@@ -135,9 +135,6 @@ struct CompileOptions {
     // Must be non-negative.
     int register_stages = 0;
     std::optional<ArithmeticRequest> arithmetic_request;
-    // Temporary dependency of unmigrated step5 only; conflicts with the new request.
-    bool use_simple_cost = false;
-    std::string arithmetic_candidate; // empty/original or mul32_split16
     // Rising-edge clock port added only when register_stages > 0. Must be a
     // non-reserved RTL identifier without data-port/signal collisions. In
     // rtl_module_body mode, include {clock_name, external_clock} in bindings.

@@ -1,6 +1,5 @@
 #include "backend/pipeline.hpp"
 #include "backend/arithmetic_regions.hpp"
-#include "backend/simple_cost.hpp"
 #include "backend/arithmetic_core.hpp"
 #include "backend/rtl_names.hpp"
 
@@ -206,17 +205,12 @@ struct Graph {
             for (const auto& v : op.operands)
                 if (v.kind != OperandKind::Literal &&
                     (v.kind != OperandKind::Symbol || !constant[v.node])) constant[id] = false;
-            const auto simple = options.use_simple_cost ? simple_cost::node(p,id) : simple_cost::Cost{};
             auto fixed = options.arithmetic_request ? arithmetic::FixedCostProvider(arithmetic::costContext(*options.arithmetic_request)).node(p,id) : arithmetic::CostEstimate{};
             if(options.arithmetic_request && !fixed.covered) throw rtlzz::ArithmeticError({"cost","cost_uncovered",fixed.reason,{},std::to_string(id)});
             if (constant[id]) continue;
             auto k = key(op);
             if(options.arithmetic_request) {
                 costs[id]=fixed.delay;areas[id]=fixed.combinational;
-            } else if (options.use_simple_cost) {
-                const auto cost = simple;
-                costs[id] = static_cast<double>(cost.delay);
-                areas[id] = cost.area;
             } else {
                 auto it = options.operation_delay_weights.find(k);
                 costs[id] = it != options.operation_delay_weights.end() ? it->second
@@ -303,7 +297,6 @@ struct Graph {
             r.register_bits += width * length;
             r.register_count += static_cast<std::size_t>(length);
         }
-        if(p.signals.size() && !areas.empty() && std::any_of(areas.begin(),areas.end(),[](auto a){return a!=0;})) r.cost_model="simple-cost-v1.1/effective-width-v2";
         if(fixed_cost) r.cost_model="fixed-op-width-v1";
         r.final_delay = *std::max_element(r.stage_delays.begin(), r.stage_delays.end());
         return r;
@@ -315,15 +308,35 @@ bool feasibleSchedule(const beir::Program& p,const Options& o,double cap,std::st
     validateOptions(o);
     if(!std::isfinite(cap) || cap<0) throw std::runtime_error("pipeline: invalid feasibility cap");
     auto normalized=p;
-    if(o.use_simple_cost || o.arithmetic_request) {beir::MutableProgram graph(normalized);graph.ensureValueFacts();normalized=graph.finish();}
+    if(o.arithmetic_request) {beir::MutableProgram graph(normalized);graph.ensureValueFacts();normalized=graph.finish();}
     Graph graph(normalized,o);std::vector<int> stages;diagnostic.clear();
     return graph.schedule(cap,stages,&diagnostic);
+}
+
+Report evaluateSchedule(const beir::Program& p,const Options& o,const std::vector<int>& stages) {
+    validateOptions(o);if(stages.size()!=p.signals.size())throw rtlzz::ArithmeticError({"scheduling","schedule_validation_error","stage map size mismatch",{},{}});
+    beir::MutableProgram facts(p);facts.ensureValueFacts();auto graph=facts.finish();return Graph(graph,o).evaluate(stages);
+}
+
+void requireSchedule(const beir::Program& p,const Options& o,double cap) {
+    validateOptions(o);if(!o.arithmetic_request||!std::isfinite(cap)||cap<0)throw rtlzz::ArithmeticError({"request_validation","invalid_request","finite abstract cap and arithmetic request required",{},{}});
+    beir::MutableProgram facts(p);facts.ensureValueFacts();auto normalized=facts.finish();Graph graph(normalized,o);
+    for(auto u:graph.unit_order) {
+        double lower=0;std::vector<double> arrivals(normalized.signals.size());
+        for(auto id:graph.units[u]) {
+            double a=0;for(const auto& v:normalized.signal(id).driver->operands)if(v.kind==OperandKind::Symbol&&graph.unit_of[v.node]==u)a=std::max(a,arrivals[v.node]);
+            arrivals[id]=a+graph.costs[id];lower=std::max(lower,arrivals[id]);
+        }
+        if(lower>cap)throw rtlzz::ArithmeticError({"scheduling","schedule_group_over_budget","indivisible group lower bound="+std::to_string(lower)+" cap="+std::to_string(cap)+" unit=abstract",graph.unit_labels[u],{}});
+    }
+    std::vector<int> stages;std::string reason;
+    if(!graph.schedule(cap,stages,&reason))throw rtlzz::ArithmeticError({"scheduling","schedule_no_placement_found","earliest grouped strategy: "+reason,{},{}});
 }
 
 void validateOptions(const Options& o) {
     if(o.arithmetic_request) {
         rtlzz::validateArithmeticRequest(*o.arithmetic_request,o.register_stages);
-        if(o.use_simple_cost || !o.operation_delay_weights.empty() || o.timing_relaxation_ratio!=0.05)
+        if(!o.operation_delay_weights.empty() || o.timing_relaxation_ratio!=0.05)
             throw rtlzz::ArithmeticError({"request_validation","invalid_request","new request conflicts with legacy cost overrides",{}, {}});
     }
     if (o.register_stages < 0 || o.register_stages == std::numeric_limits<int>::max())
@@ -356,26 +369,26 @@ void validateOptions(const Options& o) {
 Program build(const beir::Program& program, const Options& options) {
     validateOptions(options);
     beir::Program normalized = program;
-    if (options.use_simple_cost || options.arithmetic_request) {
+    if (options.arithmetic_request) {
         beir::MutableProgram facts(normalized);
         facts.ensureValueFacts();
         normalized = facts.finish();
     }
     Program result;
     result.options = options;
-    if (options.use_simple_cost) result.report.cost_model = "simple-cost-v1.1/effective-width-v2";
     result.combinational = normalized;
     result.rtl_program = normalized;
     if (!options.register_stages && !options.reset_enabled && options.input_valid_name.empty()) {
         if(!normalized.arithmetic_regions.empty()) beir::regions::validate(normalized);
-        if(options.use_simple_cost || options.arithmetic_request) {
+        if(options.arithmetic_request) {
             Graph graph(normalized,options);
             result.stages.assign(normalized.signals.size(),0);
             result.report=graph.evaluate(result.stages);
             result.report.baseline_delay=result.report.final_delay;
             result.report.allowed_delay=result.report.final_delay*105.0/100.0;
-            result.report.cost_model=options.arithmetic_request?"fixed-op-width-v1":"simple-cost-v1.1/effective-width-v2";
+            result.report.cost_model="fixed-op-width-v1";
         }
+        result.initial_stages=result.stages;
         return result;
     }
     Graph g(normalized, options);
@@ -399,6 +412,7 @@ Program build(const beir::Program& program, const Options& options) {
         }
         connect_valid_output();
         initializeResetValues(result);
+        result.initial_stages=result.stages;
         return result;
     }
     double upper = 0, lower = 0;
@@ -417,9 +431,9 @@ Program build(const beir::Program& program, const Options& options) {
         else lower = middle;
     }
     result.stages = baseline;
+    result.initial_stages=baseline;
     auto before = g.evaluate(baseline);
-    const double allowed = options.use_simple_cost ? before.final_delay*105.0/100.0
-        : before.final_delay * (1 + options.timing_relaxation_ratio);
+    const double allowed = before.final_delay * (1 + options.timing_relaxation_ratio);
     if (!std::isfinite(allowed)) throw std::runtime_error("pipeline: timing allowance overflow");
     auto current = before;
     std::size_t accepted_group_moves = 0;
@@ -437,6 +451,9 @@ Program build(const beir::Program& program, const Options& options) {
                 if (stage == original) continue;
                 for(auto member:g.units[u]) result.stages[member] = stage;
                 auto candidate = g.evaluate(result.stages);
+                if(options.arithmetic_request) result.moves.push_back({g.unit_labels[u],original,stage,false,
+                    !std::isfinite(candidate.final_delay)?"dependency_or_group_violation":candidate.final_delay>allowed?"schedule_group_over_budget":candidate.register_bits>=current.register_bits?"no_state_improvement":"eligible",
+                    candidate.final_delay,candidate.register_bits});
                 if (candidate.final_delay <= allowed && candidate.register_bits < current.register_bits &&
                     (candidate.register_bits < best.register_bits ||
                      (candidate.register_bits == best.register_bits && candidate.final_delay < best.final_delay))) {
@@ -446,7 +463,9 @@ Program build(const beir::Program& program, const Options& options) {
             for(auto member:g.units[u]) result.stages[member] = original;
         }
         if (best_node == kInvalidNodeId) break;
+        const int previous_stage=result.stages[best_node];
         for(auto member:g.units[g.unit_of[best_node]]) result.stages[member] = best_stage;
+        if(options.arithmetic_request) result.moves.push_back({g.unit_labels[g.unit_of[best_node]],previous_stage,best_stage,true,"accepted_state_improvement",best.final_delay,best.register_bits});
         current = std::move(best);
         ++accepted_group_moves;
     }
@@ -455,7 +474,7 @@ Program build(const beir::Program& program, const Options& options) {
     result.report.allowed_delay = allowed;
     result.report.baseline_register_bits = before.register_bits;
     result.report.accepted_group_moves = accepted_group_moves;
-    if(options.use_simple_cost) result.report.cost_model="simple-cost-v1.1/effective-width-v2";
+    if(options.arithmetic_request) result.report.cost_model="fixed-op-width-v1";
 
     auto& rtl = result.rtl_program;
     std::vector<std::vector<NodeId>> delayed(normalized.signals.size());

@@ -1,87 +1,64 @@
 #include "backend/mul_split.hpp"
+#include "backend/arithmetic_core.hpp"
 #include "backend/arithmetic_regions.hpp"
 #include "backend/beopt_dce.hpp"
+#include <algorithm>
 #include <set>
-#include <stdexcept>
-
 namespace pred::beir::mul_split {
 namespace {
-Operand ref(const Program& p, NodeId id) {
-    Operand v;v.node=id;v.type=p.signal(id).type;v.text=p.signal(id).name;return v;
+Operand ref(const Program& p,NodeId id){Operand v;v.node=id;v.type=p.signal(id).type;return v;}
+Operand zero(int w){Operand v;v.kind=OperandKind::Literal;v.type.width=w;v.constant.width=w;v.constant.limbs.resize((w+63)/64,0);return v;}
+[[noreturn]] void reject(const std::string& id,const std::string& why){throw rtlzz::ArithmeticError({"eligibility","template_ineligible",why,id,{}});}
 }
-Operand zero(int width) {
-    Operand v;v.kind=OperandKind::Literal;v.type.width=width;v.constant.width=width;v.constant.limbs={0};return v;
-}
-}
-Program expand32(Program p) {
-    MutableProgram facts(std::move(p));facts.ensureValueFacts();p=facts.finish();
-    std::set<NodeId> owned;
-    for(const auto& r:p.arithmetic_regions) owned.insert(r.members.begin(),r.members.end());
-    std::vector<NodeId> targets;
-    for(const auto& s:p.signals) {
-        if(owned.count(s.id) || !s.driver) continue;
-        const auto& op=*s.driver;
-        if(op.kind!=OperationKind::Binary || op.op!=OpCode::Mul || s.type.width!=64 || s.type.isArray() || op.operands.size()!=2) continue;
-        bool eligible=true;
-        for(const auto& v:op.operands) {
-            if(v.type.width<32 || v.type.isArray() || v.signed_view || v.constant.signed_view) {eligible=false;continue;}
-            // BEOPT normalizes Mul operands to the result width. Accept that
-            // zero extension only when verified facts prove every bit >=32 zero.
-            for(int bit=32;bit<v.type.width;++bit) {
-                const auto word=static_cast<std::size_t>(bit/64);const auto mask=std::uint64_t(1)<<(bit%64);
-                if(v.kind==OperandKind::Literal) {
-                    if(word<v.constant.limbs.size() && (v.constant.limbs[word]&mask)) eligible=false;
-                } else if(v.kind==OperandKind::Symbol) {
-                    const auto& f=p.signal(v.node).value;
-                    if(!f.valid || word>=f.known_zero.size() || !(f.known_zero[word]&mask)) eligible=false;
-                } else eligible=false;
-            }
+const std::vector<TemplateDescriptor>& registry(){static const std::vector<TemplateDescriptor> entries{{"original","mul-original-v1",0,"native",false},{"half","mul-block-tree-v1",2,"carry_preserving_tree",true},{"quarter","mul-block-tree-v1",4,"carry_preserving_tree",true}};return entries;}
+Program expand(Program p,const std::vector<Configuration>& configurations){
+    std::set<std::string> seen;
+    for(const auto& config:configurations){
+        if(!seen.insert(config.region_id).second)reject(config.region_id,"duplicate template configuration");
+        auto it=std::find_if(p.arithmetic_regions.begin(),p.arithmetic_regions.end(),[&](const auto& r){return r.id==config.region_id;});
+        if(it==p.arithmetic_regions.end()||it->template_version!="mul-original-v1")reject(config.region_id,"configuration requires a registered original Mul region");
+        if(!config.block_width)continue;
+        const auto old=*it;const auto anchor=old.outputs.at(0);const auto op=*p.signal(anchor).driver;
+        const int aw=arithmetic::billingWidth(p,op.operands[0]),bw=arithmetic::billingWidth(p,op.operands[1]),R=p.signal(anchor).type.width,b=config.block_width;
+        if(aw<1||bw<1||aw>128||bw>128||R<1||R>aw+bw||b<2||b>std::max(aw,bw))reject(old.id,"block template requires unsigned inputs <=128, 1<=R<=lhs+rhs and 2<=block<=max input width");
+        ArithmeticRegion region=old;region.members.clear();region.outputs.clear();region.template_version="mul-block-tree-v1";region.sharing_policy="isolated-tree-DCE-facts-v1";
+        region.internal_split_enabled=true;region.split_version="partial-products-reduction-levels-v1";region.legal_cut_groups={{}};
+        region.template_parameters={{"lhs_width",aw},{"rhs_width",bw},{"result_width",R},{"block_width",b}};
+        auto add=[&](int g,int width,OperationKind kind,std::vector<Operand> operands,OpCode code=OpCode::None){
+            while(region.legal_cut_groups.size()<=static_cast<std::size_t>(g))region.legal_cut_groups.push_back({});
+            Signal s;s.id=p.signals.size();s.name="mul_tree_"+std::to_string(anchor)+"_"+std::to_string(s.id);s.type.width=width;
+            Operation d;d.kind=kind;d.op=code;d.type=s.type;d.operands=std::move(operands);s.driver=std::move(d);
+            p.signals.push_back(s);region.members.push_back(s.id);region.legal_cut_groups[g].push_back(s.id);return s.id;
+        };
+        auto slice=[&](Operand value,int width,int lo){auto id=add(0,width,OperationKind::Slice,{value});p.signal(id).driver->hi=lo+width-1;p.signal(id).driver->lo=lo;return id;};
+        auto extend=[&](int g,NodeId id,int width){if(p.signal(id).type.width==width)return id;auto n=add(g,width,OperationKind::ZExt,{ref(p,id)});p.signal(n).driver->to_width=width;return n;};
+        std::vector<NodeId> terms;
+        for(int ai=0;ai<aw;ai+=b)for(int bi=0;bi<bw;bi+=b){
+            int xw=std::min(b,aw-ai),yw=std::min(b,bw-bi);auto a=slice(op.operands[0],xw,ai),c=slice(op.operands[1],yw,bi);
+            auto product=add(0,xw+yw,OperationKind::Binary,{ref(p,a),ref(p,c)},OpCode::Mul);
+            // Concatenation expresses an exact constant shift; no host-width or
+            // SystemVerilog implicit expression-size dependence.
+            if(ai+bi)product=add(0,xw+yw+ai+bi,OperationKind::Concat,{ref(p,product),zero(ai+bi)});
+            terms.push_back(product);
         }
-        if(eligible) targets.push_back(s.id);
+        int group=0;
+        while(terms.size()>1){++group;std::vector<NodeId> next;
+            for(std::size_t i=0;i<terms.size();i+=2){
+                if(i+1==terms.size()){next.push_back(terms[i]);continue;}
+                // Each sum gains one bit; even the conservative intermediate
+                // bound is preserved until the single explicit final truncation.
+                const int width=std::max(p.signal(terms[i]).type.width,p.signal(terms[i+1]).type.width)+1;
+                auto a=extend(group,terms[i],width),c=extend(group,terms[i+1],width);
+                next.push_back(add(group,width,OperationKind::AddCarry,{ref(p,a),ref(p,c),zero(1)}));
+            }
+            terms=std::move(next);
+        }
+        NodeId result=terms.at(0);int width=p.signal(result).type.width;
+        if(width>R){result=add(group,R,OperationKind::Slice,{ref(p,result)});p.signal(result).driver->hi=R-1;p.signal(result).driver->lo=0;}
+        else result=extend(group,result,R);
+        region.outputs={result};Operation alias;alias.type=p.signal(anchor).type;alias.operands={ref(p,result)};p.signal(anchor).driver=std::move(alias);p.signal(anchor).value={};
+        *it=std::move(region);
     }
-    if(targets.empty()) throw std::runtime_error("mul split: no eligible unsigned 32x32 full64 operation after BEOPT");
-    for(auto original:targets) {
-        const auto op=*p.signal(original).driver;
-        if(op.arithmetic_origin.empty()) throw std::runtime_error("mul split: missing stable operation identity");
-        ArithmeticRegion r;r.id=op.arithmetic_origin;r.operation="mul_u32_full64";
-        r.semantics="unsigned-32x32-full64-v1";r.template_version="mul32-split16-v1";
-        r.sharing_policy="post-BEOPT-Mul-unique-members-DCE-facts-v1";
-        r.internal_split_enabled=true;r.split_version="partial-middle-high-groups-v1";
-        r.inputs=op.operands;r.legal_cut_groups.resize(3);
-        auto add=[&](int group,int width,OperationKind kind,std::vector<Operand> operands,OpCode code=OpCode::None) {
-            Signal s;s.id=p.signals.size();s.type.width=width;s.name="mul_split_"+std::to_string(original)+"_"+std::to_string(s.id);
-            Operation d;d.kind=kind;d.op=code;d.type=s.type;d.operands=std::move(operands);
-            s.driver=d;r.members.push_back(s.id);r.legal_cut_groups[group].push_back(s.id);p.signals.push_back(s);return s.id;
-        };
-        auto slice=[&](int group,Operand value,int hi,int lo) {
-            auto n=add(group,hi-lo+1,OperationKind::Slice,{value});p.signal(n).driver->hi=hi;p.signal(n).driver->lo=lo;return n;
-        };
-        auto extend=[&](int group,NodeId value,int width) {
-            auto n=add(group,width,OperationKind::ZExt,{ref(p,value)});p.signal(n).driver->to_width=width;return n;
-        };
-        auto carry=[&](int group,NodeId a,NodeId b,int width) {
-            return add(group,width,OperationKind::AddCarry,{ref(p,a),ref(p,b),zero(1)});
-        };
-        auto a0=slice(0,op.operands[0],15,0),a1=slice(0,op.operands[0],31,16);
-        auto b0=slice(0,op.operands[1],15,0),b1=slice(0,op.operands[1],31,16);
-        auto p0=add(0,32,OperationKind::Binary,{ref(p,a0),ref(p,b0)},OpCode::Mul);
-        auto p1=add(0,32,OperationKind::Binary,{ref(p,a0),ref(p,b1)},OpCode::Mul);
-        auto p2=add(0,32,OperationKind::Binary,{ref(p,a1),ref(p,b0)},OpCode::Mul);
-        auto p3=add(0,32,OperationKind::Binary,{ref(p,a1),ref(p,b1)},OpCode::Mul);
-        auto low=slice(0,ref(p,p0),15,0),p0high=slice(0,ref(p,p0),31,16);
-        auto p0ext=extend(1,p0high,32);
-        auto m0=carry(1,p0ext,p1,33),p2ext=extend(1,p2,33);
-        auto mid=carry(1,m0,p2ext,34);
-        auto midhigh=slice(2,ref(p,mid),33,16),midext=extend(2,midhigh,32);
-        auto high=carry(2,p3,midext,33);
-        auto hi32=slice(2,ref(p,high),31,0),mi16=slice(2,ref(p,mid),15,0);
-        auto result=add(2,64,OperationKind::Concat,{ref(p,hi32),ref(p,mi16),ref(p,low)});
-        r.outputs={result};Operation alias;alias.type=p.signal(original).type;alias.operands={ref(p,result)};
-        p.signal(original).driver=alias;p.signal(original).value={};p.arithmetic_regions.push_back(r);
-    }
-    p.temp_names_initialized=false;
-    // Frozen cleanup preserves group boundaries: DCE + static facts only.
-    MutableProgram graph(std::move(p));opt::eliminateDeadNodes(graph);graph.ensureValueFacts();
-    p=graph.finish();regions::validate(p);return p;
+    p.temp_names_initialized=false;MutableProgram graph(std::move(p));opt::eliminateDeadNodes(graph);graph.ensureValueFacts();p=graph.finish();regions::validate(p);arithmetic::validate(p,"template_expansion");return p;
 }
 }

@@ -14,7 +14,6 @@ namespace pred::pipeline {
 struct Options {
     int register_stages = 0;
     std::optional<rtlzz::ArithmeticRequest> arithmetic_request;
-    bool use_simple_cost = false;
     std::string clock_name = "clk";
     std::map<rtlzz::PipelineOperation, double> operation_delay_weights;
     double timing_relaxation_ratio = 0.05;
@@ -49,11 +48,18 @@ struct Program {
     // Stage 0 is the input valid; stages 1..N are always-advancing registers.
     std::vector<beir::NodeId> valid_nodes;
     Report report;
+    std::vector<int> initial_stages;
+    struct Move { std::string group; int from=0,to=0; bool accepted=false; std::string reason; double delay=0; std::uint64_t bits=0; };
+    std::vector<Move> moves;
 };
 
 void initializeResetValues(Program& program);
 void validateOptions(const Options& options);
 Program build(const beir::Program& program, const Options& options);
+// Same constraints/costs as initial, move and final scheduling. Invalid maps
+// report infinite delay; callers must not materialize them.
+Report evaluateSchedule(const beir::Program&,const Options&,const std::vector<int>&);
+void requireSchedule(const beir::Program&,const Options&,double cap);
 // Uses the same group placement as build; a diagnostic identifies the failed
 // group, cap, legal stage interval and observed arrival. Cap uses provider units.
 bool feasibleSchedule(const beir::Program& program, const Options& options,

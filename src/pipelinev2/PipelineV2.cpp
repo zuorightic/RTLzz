@@ -1,10 +1,12 @@
+#include <llvm/Support/JSON.h>
+#include <llvm/Support/FormatVariadic.h>
 #include "pipelinev2/PipelineV2.h"
 #include "backend/rtl_names.hpp"
 #include "backend/pipeline_valid.hpp"
 
 #include "backend/beopt.hpp"
 #include "backend/arithmetic_regions.hpp"
-#include "backend/mul_split.hpp"
+#include "backend/arithmetic_selection.hpp"
 #include "backend/arithmetic_core.hpp"
 #include "backend/circt_bridge.hpp"
 #include "backend/rtlgen.hpp"
@@ -431,7 +433,6 @@ PipelineResult compile(const PipelineConfig& config) {
     try {
         if(config.arithmetic_request) {
             rtlzz::validateArithmeticRequest(*config.arithmetic_request,config.pipeline?config.pipeline->register_stages:0);
-            if(!config.arithmetic_candidate.empty())throw rtlzz::ArithmeticError({"request_validation","invalid_request","new request cannot use the old candidate selector",{}, {}});
         }
 
         if (config.pipeline) {
@@ -587,10 +588,6 @@ PipelineResult compile(const PipelineConfig& config) {
             return rtlgen::collectDebugSignals(beir_program, "");
         };
 
-        if (!config.arithmetic_candidate.empty() && config.arithmetic_candidate != "original") {
-            if(config.arithmetic_candidate != "mul32_split16") throw std::runtime_error("unknown arithmetic candidate");
-            beir_program = beir::mul_split::expand32(std::move(beir_program));
-        }
         if(config.arithmetic_request) {
             beir::arithmetic::validate(beir_program,"expanded_graph",config.use_circt);
             beir_program=beir::arithmetic::normalizeSelections(std::move(beir_program));
@@ -598,11 +595,15 @@ PipelineResult compile(const PipelineConfig& config) {
             beir::arithmetic::validate(beir_program,"normalized_graph",config.use_circt);
         }
         PipelineResult result;
+        std::string arithmetic_selection;
         if (config.arithmetic_request || (config.pipeline && (config.pipeline->register_stages > 0 || config.pipeline->reset_enabled || !config.pipeline->input_valid_name.empty()))) {
             if (config.progress_callback) config.progress_callback("RTLzz pipeline scheduling and register materialization");
             auto settings=config.pipeline.value_or(pipeline::Options{});
             settings.arithmetic_request=config.arithmetic_request;
-            try {result.pipeline_program = pipeline::build(beir_program, settings);}
+            try {
+                if(config.arithmetic_request) {auto selected=beir::arithmetic::select(beir_program,settings);arithmetic_selection=std::move(selected.report);result.pipeline_program=std::move(selected.pipeline);beir_program=result.pipeline_program->combinational;}
+                else result.pipeline_program = pipeline::build(beir_program, settings);
+            }
             catch(const rtlzz::ArithmeticError&){throw;}
             catch(const std::exception& e){if(!config.arithmetic_request)throw;throw rtlzz::ArithmeticError({"scheduling","schedule_validation_error",e.what(),{}, {}});}
             if(config.arithmetic_request) {
@@ -665,6 +666,11 @@ PipelineResult compile(const PipelineConfig& config) {
             result.pipeline_report?&*result.pipeline_report:nullptr,
             result.pipeline_program?result.pipeline_program->stages:std::vector<int>{},result.output_text,
             result.pipeline_program?&result.pipeline_program->options:nullptr);
+        if(config.arithmetic_request && !arithmetic_selection.empty()) {
+            auto parsed=llvm::json::parse(result.arithmetic_report);auto selection=llvm::json::parse(arithmetic_selection);
+            (*parsed->getAsObject())["selection"]=std::move(*selection);
+            result.arithmetic_report=llvm::formatv("{0:2}",*parsed).str()+"\n";
+        }
         result.beir_program = std::move(beir_program);
         return result;
     } catch (const rtlzz::ArithmeticError& ex) {

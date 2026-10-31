@@ -1,5 +1,6 @@
 #include "backend/arithmetic_core.hpp"
 #include "backend/arithmetic_regions.hpp"
+#include "backend/mul_contract.hpp"
 #include "backend/pipeline.hpp"
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -147,6 +148,32 @@ void validate(const Program& p,const std::string& phase,bool circt,const std::ve
                    (a.kind==OperandKind::Symbol && a.node!=b.node)||
                    (a.kind==OperandKind::Literal && (a.constant.width!=b.constant.width||a.constant.limbs!=b.constant.limbs)))reject("Mul region input mapping mismatch");
             }
+        } else if(r.template_version=="mul-block-tree-v1") {
+            if(r.operation!="mul_unsigned"||r.semantics!="unsigned-mod-result-v2"||!r.internal_split_enabled||r.inputs.size()<2||r.outputs.size()!=1||r.split_version!="partial-products-reduction-levels-v1")reject("malformed blocked Mul contract");
+            const auto& t=r.template_parameters;
+            if(t.size()!=4||!t.count("lhs_width")||!t.count("rhs_width")||!t.count("result_width")||!t.count("block_width"))reject("missing blocked Mul parameters");
+            if(t.at("lhs_width")<1||t.at("lhs_width")>128||t.at("rhs_width")<1||t.at("rhs_width")>128||t.at("block_width")<2||t.at("block_width")>std::max(t.at("lhs_width"),t.at("rhs_width"))||t.at("result_width")<1||t.at("result_width")>t.at("lhs_width")+t.at("rhs_width"))reject("blocked Mul parameter range");
+            if(p.signal(r.outputs[0]).type.width!=t.at("result_width"))reject("blocked Mul output width");
+            unsigned products=0;
+            for(auto id:r.members) {
+                const auto& s=p.signal(id);const auto& op=*s.driver;
+                if(op.kind==OperationKind::Binary&&op.op==OpCode::Mul) {
+                    ++products;if(op.operands.size()!=2||s.type.width!=op.operands[0].type.width+op.operands[1].type.width||op.operands[0].type.width>t.at("block_width")||op.operands[1].type.width>t.at("block_width"))reject("partial product precision mismatch");
+                }
+                if(op.kind==OperationKind::AddCarry) {
+                    int widest=0;
+                    for(unsigned i=0;i<2;++i) {
+                        if(op.operands[i].kind!=OperandKind::Symbol)reject("tree sum requires explicit extended operands");
+                        const auto& extension=*p.signal(op.operands[i].node).driver;
+                        if(extension.kind!=OperationKind::ZExt||extension.operands.size()!=1)reject("tree sum lost explicit precision extension");
+                        widest=std::max(widest,extension.operands[0].type.width);
+                    }
+                    if(s.type.width!=widest+1)reject("tree sum carry precision mismatch");
+                }
+            }
+            if(products!=static_cast<unsigned>(((t.at("lhs_width")+t.at("block_width")-1)/t.at("block_width"))*((t.at("rhs_width")+t.at("block_width")-1)/t.at("block_width"))))reject("partial product coverage mismatch");
+            validateBlockTree(p,r,phase);
+
         } else if(r.template_version=="softfloat3d-bitvector-mul-v1") {
             if(r.operation!="fp32_mul_rne"||r.semantics!="binary32-rne-tininess-after-canonicalNaN-v1"||r.internal_split_enabled||!r.template_parameters.empty()||r.inputs.size()!=2||r.outputs.size()!=1)
                 reject("malformed binary32 atomic region contract");
@@ -291,7 +318,7 @@ std::string report(const Program& p,const rtlzz::ArithmeticRequest& request,cons
         auto cost=costs.group(p,r.members);Object parameters;for(const auto& kv:r.template_parameters)parameters[kv.first]=kv.second;
         regionsJson.push_back(Object{{"id",r.id},{"operation",r.operation},{"semantic_version",r.semantics},{"template_id",r.template_version},{"parameters",std::move(parameters)},
             {"sharing_policy",r.sharing_policy},{"members",std::move(members)},{"inputs",std::move(inputs)},{"outputs",std::move(outputs)},{"legal_groups",std::move(groups)},
-            {"generated",true},{"numerically_validated_by_this_compile",false},{"internally_cuttable",r.internal_split_enabled},{"C_selected",false},{"D_covered",false},{"D_selected",false},{"physically_evaluated",false},
+            {"generated",true},{"numerically_validated_by_this_compile",false},{"internally_cuttable",r.internal_split_enabled},{"C_selected",request.candidate_policy=="mul-candidates-v1"},{"D_covered",false},{"D_selected",false},{"physically_evaluated",false},
             {"delay",cost.delay},{"comb",static_cast<std::int64_t>(cost.combinational)}});
     }
     Array ports;for(const auto& port:p.ports){Array dims,ids;for(int dim:port.type.array_dims)dims.push_back(dim);for(auto id:port.element_nodes)ids.push_back(std::to_string(id));ports.push_back(Object{{"name",port.name},{"direction",static_cast<int>(port.direction)},{"width",port.type.width},{"dims",std::move(dims)},{"nodes",std::move(ids)}});}
@@ -311,7 +338,7 @@ std::string report(const Program& p,const rtlzz::ArithmeticRequest& request,cons
             {"cost_source_sha256",request.fixed_cost_table_sha256},{"model_bundle_sha256",request.model_bundle_sha256},{"candidate_policy",request.candidate_policy},{"semantic_profile",request.semantic_profile},
             {"L",request.latency},{"II",request.initiation_interval},{"target_period_ps",request.target_period_ps}}},
         {"delay_unit","abstract"},{"comb_unit","abstract"},{"state_unit","saved_bits"},{"D_inference_implemented",false},{"cost_query_context",Object{{"target_platform",costs.context().target_platform},{"platform_profile_sha256",costs.context().platform_profile_sha256},{"evaluation_stage",costs.context().evaluation_stage},{"feature_schema",costs.context().feature_schema},{"stage_index",costs.context().stage_index},{"model_bundle_sha256",costs.context().model_bundle_sha256}}},
-        {"capabilities",Object{{"original_unsigned_mul","generated; atomic"},{"binary32_mul_rne","generated; atomic"},{"mul_half_quarter","reserved_step5"},{"backend_model","reserved_step7; requests fail closed"},{"AES_Sigmoid_fixedpoint","reserved; requests rejected"}}}};
+        {"capabilities",Object{{"original_unsigned_mul","generated; atomic"},{"binary32_mul_rne","generated; atomic"},{"mul_half_quarter","generated; legal reduction levels; request dependent selection"},{"backend_model","reserved_step7; requests fail closed"},{"AES_Sigmoid_fixedpoint","reserved; requests rejected"}}}};
     if(schedule)result["pipeline"]=Object{{"baseline_delay",schedule->baseline_delay},{"allowed_delay",schedule->allowed_delay},{"final_delay",schedule->final_delay},{"comb",static_cast<std::int64_t>(schedule->combinational_cost)},
         {"register_bits",schedule->register_bits},{"register_count",static_cast<std::uint64_t>(schedule->register_count)}};
     return llvm::formatv("{0:2}",Value(std::move(result))).str()+"\n";
