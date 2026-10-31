@@ -5,6 +5,7 @@
 #include "backend/beopt.hpp"
 #include "backend/arithmetic_regions.hpp"
 #include "backend/mul_split.hpp"
+#include "backend/arithmetic_core.hpp"
 #include "backend/circt_bridge.hpp"
 #include "backend/rtlgen.hpp"
 #include "debug/RTLZZException.h"
@@ -428,6 +429,11 @@ PipelineResult compile(const PipelineConfig& config) {
     s11beir::BEIRResult s11;
     beir::Program beir_program;
     try {
+        if(config.arithmetic_request) {
+            rtlzz::validateArithmeticRequest(*config.arithmetic_request,config.pipeline?config.pipeline->register_stages:0);
+            if(!config.arithmetic_candidate.empty())throw rtlzz::ArithmeticError({"request_validation","invalid_request","new request cannot use the old candidate selector",{}, {}});
+        }
+
         if (config.pipeline) {
             pipeline::validateOptions(*config.pipeline);
         }
@@ -585,10 +591,26 @@ PipelineResult compile(const PipelineConfig& config) {
             if(config.arithmetic_candidate != "mul32_split16") throw std::runtime_error("unknown arithmetic candidate");
             beir_program = beir::mul_split::expand32(std::move(beir_program));
         }
+        if(config.arithmetic_request) {
+            beir::arithmetic::validate(beir_program,"expanded_graph",config.use_circt);
+            beir_program=beir::arithmetic::normalizeSelections(std::move(beir_program));
+            beir_program=beir::arithmetic::registerOriginalMultipliers(std::move(beir_program));
+            beir::arithmetic::validate(beir_program,"normalized_graph",config.use_circt);
+        }
         PipelineResult result;
-        if (config.pipeline && (config.pipeline->register_stages > 0 || config.pipeline->reset_enabled || !config.pipeline->input_valid_name.empty())) {
+        if (config.arithmetic_request || (config.pipeline && (config.pipeline->register_stages > 0 || config.pipeline->reset_enabled || !config.pipeline->input_valid_name.empty()))) {
             if (config.progress_callback) config.progress_callback("RTLzz pipeline scheduling and register materialization");
-            result.pipeline_program = pipeline::build(beir_program, *config.pipeline);
+            auto settings=config.pipeline.value_or(pipeline::Options{});
+            settings.arithmetic_request=config.arithmetic_request;
+            try {result.pipeline_program = pipeline::build(beir_program, settings);}
+            catch(const rtlzz::ArithmeticError&){throw;}
+            catch(const std::exception& e){if(!config.arithmetic_request)throw;throw rtlzz::ArithmeticError({"scheduling","schedule_validation_error",e.what(),{}, {}});}
+            if(config.arithmetic_request) {
+                pipeline::validateProgram(*result.pipeline_program);
+                std::vector<std::string> controls;
+                if(settings.register_stages>0){controls.push_back(settings.clock_name);if(settings.reset_enabled)controls.push_back(settings.reset_name);}
+                beir::arithmetic::validate(result.pipeline_program->rtl_program,"materialized_graph",config.use_circt,controls);
+            }
             result.pipeline_report = result.pipeline_program->report;
         }
         const auto& debug_program = result.pipeline_program
@@ -638,8 +660,16 @@ PipelineResult compile(const PipelineConfig& config) {
         case OutputKind::PortMetadata:
             break;
         }
+        if(config.arithmetic_request) result.arithmetic_report=beir::arithmetic::report(
+            result.pipeline_program?result.pipeline_program->combinational:beir_program,*config.arithmetic_request,
+            result.pipeline_report?&*result.pipeline_report:nullptr,
+            result.pipeline_program?result.pipeline_program->stages:std::vector<int>{},result.output_text,
+            result.pipeline_program?&result.pipeline_program->options:nullptr);
         result.beir_program = std::move(beir_program);
         return result;
+    } catch (const rtlzz::ArithmeticError& ex) {
+        auto result=errorResult(ex.diagnostic.failure_stage,ex.what(),std::nullopt,current_debug_text,current_debug_signals);
+        result.arithmetic_diagnostic=ex.diagnostic;result.arithmetic_report=rtlzz::arithmeticDiagnosticJson(ex.diagnostic,config.arithmetic_request?&*config.arithmetic_request:nullptr);return result;
     } catch (const RTLZZException& ex) {
         return errorResult("pipelinev2",
                            ex.what(),

@@ -15,7 +15,7 @@ static void printUsage(const char* prog) {
               << " <source.cpp> --top <function_name> [--format beir|rtl|portmeta]"
               << " [--input source.cpp] [--vullib DIR] [--unroll-limit N]"
               << " [--max-leaf-symbols N] [--latency N] [--clock-name NAME]"
-              << " [--beopt OPT ...] [--circt] [--clang-arg ARG ...] [-o output_file]"
+              << " [--beopt OPT ...] [--circt] [--arithmetic-request JSON] [--arithmetic-report JSON] [--clang-arg ARG ...] [-o output_file]"
               << " [--release|-r] [--rtl-debug-file FILE] [--no-rtl-debug]\n";
     std::cerr << "Required: source.cpp and --top. Default format is rtl.\n";
     std::cerr << "Default output files append .sv, .beir, or .ptmt to the input file path; use -o - for stdout.\n";
@@ -193,6 +193,8 @@ static int runMain(int argc, char* argv[]) {
     bool emit_rtl_debug = true;
     bool release = false;
     bool use_circt = false;
+    bool latency_explicit = false;
+    std::string arithmetic_request_file, arithmetic_report_file;
     std::vector<std::string> clang_args;
     std::vector<std::string> beopt_args;
 
@@ -218,6 +220,10 @@ static int runMain(int argc, char* argv[]) {
             emit_rtl_debug = true;
         } else if (arg == "--release" || arg == "-r") {
             release = true;
+        } else if (arg == "--arithmetic-request" && i+1<argc) {
+            arithmetic_request_file=argv[++i];
+        } else if (arg == "--arithmetic-report" && i+1<argc) {
+            arithmetic_report_file=argv[++i];
         } else if (arg == "--circt") {
             use_circt = true;
         } else if (arg == "--no-rtl-debug") {
@@ -237,6 +243,7 @@ static int runMain(int argc, char* argv[]) {
                 return 1;
             }
             register_stages = static_cast<int>(stages);
+            latency_explicit = true;
         } else if (arg == "--clock-name" && i + 1 < argc) {
             clock_name = argv[++i];
         } else if (arg == "--max-leaf-symbols" && i + 1 < argc) {
@@ -297,6 +304,12 @@ static int runMain(int argc, char* argv[]) {
         std::cerr << read_error << "\n";
         return 1;
     }
+    if(!arithmetic_request_file.empty()) {
+        try {options.arithmetic_request=rtlzz::loadArithmeticRequest(arithmetic_request_file);}
+        catch(const rtlzz::ArithmeticError& e){std::cerr<<e.what()<<"\n";if(!arithmetic_report_file.empty()){std::ofstream out(arithmetic_report_file);out<<rtlzz::arithmeticDiagnosticJson(e.diagnostic);}return 1;}
+        if(!latency_explicit)register_stages=options.arithmetic_request->latency-1;
+        if(arithmetic_report_file.empty() && output_file!="-")arithmetic_report_file=output_file+".arithmetic.json";
+    }
     options.source_name = source_file;
     options.top_function = top_function;
     options.unroll_limit = unroll_limit;
@@ -318,6 +331,9 @@ static int runMain(int argc, char* argv[]) {
         result = rtlzz::compileToBeir(std::move(options));
     } else {
         result = rtlzz::compileToRtl(std::move(options));
+    }
+    if(!arithmetic_report_file.empty() && !result.arithmetic_report.empty()) {
+        std::ofstream report(arithmetic_report_file);if(!report){std::cerr<<"cannot write arithmetic report\n";return 1;}report<<result.arithmetic_report;
     }
     if (!result.ok()) {
         std::cerr << "Error: " << result.error << "\n";

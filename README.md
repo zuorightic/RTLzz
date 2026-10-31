@@ -86,3 +86,6 @@ flattens and balances Boolean trees and applies constant, idempotence,
 complement, absorption, and one-complement consensus identities. General
 priority muxes whose branches cannot be represented by these identities remain
 as `Ite` nodes.
+
+
+Arithmetic compiler requests are documented in [backend/arithmetic_interfaces.md](src/backend/arithmetic_interfaces.md). `--arithmetic-request` binds platform/profile, fixed abstract cost, semantic policy and L/II; supported original Mul and binary32 implementations share region protection, scheduling and structured reports. Half/quarter internal templates and offline model inference remain later steps; unsupported/model requests fail explicitly.

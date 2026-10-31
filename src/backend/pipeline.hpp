@@ -13,6 +13,7 @@ namespace pred::pipeline {
 // directly in CompileOptions. rtlzz.cpp translates between the two layers.
 struct Options {
     int register_stages = 0;
+    std::optional<rtlzz::ArithmeticRequest> arithmetic_request;
     bool use_simple_cost = false;
     std::string clock_name = "clk";
     std::map<rtlzz::PipelineOperation, double> operation_delay_weights;

@@ -1,6 +1,7 @@
 #include "backend/pipeline.hpp"
 #include "backend/arithmetic_regions.hpp"
 #include "backend/simple_cost.hpp"
+#include "backend/arithmetic_core.hpp"
 #include "backend/rtl_names.hpp"
 
 #include <algorithm>
@@ -87,6 +88,7 @@ std::uint64_t bits(const ValueType& type) {
 struct Graph {
     const beir::Program& p;
     int last;
+    bool fixed_cost = false;
     NodeId valid_input = kInvalidNodeId, valid_output = kInvalidNodeId;
     std::vector<NodeId> order;
     std::vector<std::vector<NodeId>> users;
@@ -101,6 +103,8 @@ struct Graph {
         : p(program), last(options.register_stages), users(p.signals.size()),
           live(p.signals.size()), input(live.size()), output(live.size()),
           constant(live.size()), costs(live.size()), areas(live.size()) {
+        fixed_cost=options.arithmetic_request.has_value();
+        if (options.arithmetic_request) beir::arithmetic::validate(p,"cost_preflight");
         if (!p.arithmetic_regions.empty()) beir::regions::validate(p);
         for(const auto& r:p.arithmetic_regions) if(!r.internal_registers.empty())
             throw std::runtime_error("pipeline: cannot schedule materialized region registers");
@@ -203,9 +207,13 @@ struct Graph {
                 if (v.kind != OperandKind::Literal &&
                     (v.kind != OperandKind::Symbol || !constant[v.node])) constant[id] = false;
             const auto simple = options.use_simple_cost ? simple_cost::node(p,id) : simple_cost::Cost{};
+            auto fixed = options.arithmetic_request ? arithmetic::FixedCostProvider(arithmetic::costContext(*options.arithmetic_request)).node(p,id) : arithmetic::CostEstimate{};
+            if(options.arithmetic_request && !fixed.covered) throw rtlzz::ArithmeticError({"cost","cost_uncovered",fixed.reason,{},std::to_string(id)});
             if (constant[id]) continue;
             auto k = key(op);
-            if (options.use_simple_cost) {
+            if(options.arithmetic_request) {
+                costs[id]=fixed.delay;areas[id]=fixed.combinational;
+            } else if (options.use_simple_cost) {
                 const auto cost = simple;
                 costs[id] = static_cast<double>(cost.delay);
                 areas[id] = cost.area;
@@ -296,6 +304,7 @@ struct Graph {
             r.register_count += static_cast<std::size_t>(length);
         }
         if(p.signals.size() && !areas.empty() && std::any_of(areas.begin(),areas.end(),[](auto a){return a!=0;})) r.cost_model="simple-cost-v1.1/effective-width-v2";
+        if(fixed_cost) r.cost_model="fixed-op-width-v1";
         r.final_delay = *std::max_element(r.stage_delays.begin(), r.stage_delays.end());
         return r;
     }
@@ -306,12 +315,17 @@ bool feasibleSchedule(const beir::Program& p,const Options& o,double cap,std::st
     validateOptions(o);
     if(!std::isfinite(cap) || cap<0) throw std::runtime_error("pipeline: invalid feasibility cap");
     auto normalized=p;
-    if(o.use_simple_cost) {beir::MutableProgram graph(normalized);graph.ensureValueFacts();normalized=graph.finish();}
+    if(o.use_simple_cost || o.arithmetic_request) {beir::MutableProgram graph(normalized);graph.ensureValueFacts();normalized=graph.finish();}
     Graph graph(normalized,o);std::vector<int> stages;diagnostic.clear();
     return graph.schedule(cap,stages,&diagnostic);
 }
 
 void validateOptions(const Options& o) {
+    if(o.arithmetic_request) {
+        rtlzz::validateArithmeticRequest(*o.arithmetic_request,o.register_stages);
+        if(o.use_simple_cost || !o.operation_delay_weights.empty() || o.timing_relaxation_ratio!=0.05)
+            throw rtlzz::ArithmeticError({"request_validation","invalid_request","new request conflicts with legacy cost overrides",{}, {}});
+    }
     if (o.register_stages < 0 || o.register_stages == std::numeric_limits<int>::max())
         throw std::runtime_error("pipeline: register_stages must be non-negative and less than INT_MAX");
     if (!std::isfinite(o.timing_relaxation_ratio) || o.timing_relaxation_ratio < 0)
@@ -342,7 +356,7 @@ void validateOptions(const Options& o) {
 Program build(const beir::Program& program, const Options& options) {
     validateOptions(options);
     beir::Program normalized = program;
-    if (options.use_simple_cost) {
+    if (options.use_simple_cost || options.arithmetic_request) {
         beir::MutableProgram facts(normalized);
         facts.ensureValueFacts();
         normalized = facts.finish();
@@ -354,13 +368,13 @@ Program build(const beir::Program& program, const Options& options) {
     result.rtl_program = normalized;
     if (!options.register_stages && !options.reset_enabled && options.input_valid_name.empty()) {
         if(!normalized.arithmetic_regions.empty()) beir::regions::validate(normalized);
-        if(options.use_simple_cost) {
+        if(options.use_simple_cost || options.arithmetic_request) {
             Graph graph(normalized,options);
             result.stages.assign(normalized.signals.size(),0);
             result.report=graph.evaluate(result.stages);
             result.report.baseline_delay=result.report.final_delay;
             result.report.allowed_delay=result.report.final_delay*105.0/100.0;
-            result.report.cost_model="simple-cost-v1.1/effective-width-v2";
+            result.report.cost_model=options.arithmetic_request?"fixed-op-width-v1":"simple-cost-v1.1/effective-width-v2";
         }
         return result;
     }
@@ -559,7 +573,7 @@ void validateProgram(const Program& p) {
         for(std::size_t i=0;i<p.combinational.arithmetic_regions.size();++i) {
             const auto& a=p.combinational.arithmetic_regions[i];const auto& b=p.rtl_program.arithmetic_regions[i];
             if(a.id!=b.id || a.operation!=b.operation || a.semantics!=b.semantics ||
-               a.template_version!=b.template_version || a.sharing_policy!=b.sharing_policy ||
+               a.template_version!=b.template_version || a.template_parameters!=b.template_parameters || a.sharing_policy!=b.sharing_policy ||
                a.internal_split_enabled!=b.internal_split_enabled || a.split_version!=b.split_version ||
                a.members!=b.members || a.outputs!=b.outputs || a.legal_cut_groups!=b.legal_cut_groups)
                 throw std::runtime_error("pipeline: region identities or membership changed");
@@ -573,7 +587,26 @@ void validateProgram(const Program& p) {
                 throw std::runtime_error("pipeline: region internal register ownership changed");
         }
     }
-    if (!p.options.register_stages) return;
+    auto validate_region_inputs=[&](const std::vector<NodeId>* origins) {
+        auto same_input=[&](const beir::Operand& a,const beir::Operand& b) {
+            if(a.kind!=b.kind||!beir::sameType(a.type,b.type)||a.signed_view!=b.signed_view)return false;
+            if(a.kind==OperandKind::Literal)return a.constant.width==b.constant.width&&a.constant.signed_view==b.constant.signed_view&&a.constant.limbs==b.constant.limbs;
+            if(a.kind!=OperandKind::Symbol)return false;
+            if(!origins)return a.node==b.node;
+            return b.node<origins->size()&&(*origins)[b.node]==a.node;
+        };
+        for(std::size_t i=0;i<p.combinational.arithmetic_regions.size();++i) {
+            const auto& a=p.combinational.arithmetic_regions[i];const auto& b=p.rtl_program.arithmetic_regions[i];
+            if(!a.internal_split_enabled) {
+                if(a.inputs.size()!=b.inputs.size())throw std::runtime_error("pipeline: atomic region input count changed");
+                for(std::size_t k=0;k<a.inputs.size();++k)if(!same_input(a.inputs[k],b.inputs[k]))throw std::runtime_error("pipeline: atomic region input identity changed");
+            } else {
+                for(const auto& actual:b.inputs)if(std::none_of(a.inputs.begin(),a.inputs.end(),[&](const auto& original){return same_input(original,actual);}))throw std::runtime_error("pipeline: split region has an undeclared logical input");
+                for(const auto& original:a.inputs)if(std::none_of(b.inputs.begin(),b.inputs.end(),[&](const auto& actual){return same_input(original,actual);}))throw std::runtime_error("pipeline: split region lost a logical input");
+            }
+        }
+    };
+    if (!p.options.register_stages) {validate_region_inputs(nullptr);return;}
     Graph g(p.combinational, p.options);
     if (p.stages.size() != p.combinational.signals.size() ||
         p.rtl_program.signals.size() != p.combinational.signals.size() + p.registers.size())
@@ -604,6 +637,7 @@ void validateProgram(const Program& p) {
         if (storage > UINT64_MAX - width) throw std::runtime_error("pipeline: register storage overflow");
         storage += width;
     }
+    validate_region_inputs(&origins);
     if (g.valid_input != kInvalidNodeId) {
         if (p.valid_nodes.size() != static_cast<std::size_t>(g.last)+1 || p.valid_nodes.front() != g.valid_input)
             throw std::runtime_error("pipeline: invalid valid chain");

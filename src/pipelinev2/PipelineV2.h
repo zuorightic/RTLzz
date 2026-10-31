@@ -32,6 +32,7 @@ struct PipelineConfig {
     int unroll_limit = 1024;
     // Optional deterministic arithmetic candidate expansion after BEOPT.
     std::string arithmetic_candidate;
+    std::optional<rtlzz::ArithmeticRequest> arithmetic_request;
     std::optional<pipeline::Options> pipeline;
     // Zero means no artificial S7 leaf-symbol limit.
     std::size_t max_leaf_symbols = 0;
@@ -61,6 +62,8 @@ struct PipelineResult {
     std::vector<rtlgen::RtlDebugSignal> error_rtl_debug_signals;
     std::vector<rtlgen::RtlDebugSignal> error_signal_debug_signals;
     std::string error;
+    std::optional<rtlzz::ArithmeticDiagnostic> arithmetic_diagnostic;
+    std::string arithmetic_report;
 
     bool ok() const { return error.empty(); }
 };

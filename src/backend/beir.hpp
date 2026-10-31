@@ -3,6 +3,7 @@
 #include "debug/DebugLoc.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -197,6 +198,8 @@ struct ArithmeticRegion {
     std::string semantics = "binary32-rne-tininess-after-canonicalNaN-v1";
     std::string template_version = "softfloat3d-bitvector-mul-v1";
     std::string sharing_policy = "semantic-marker-and-isolated-BEOPT-v1";
+    // Versioned implementation parameters travel with region identity.
+    std::map<std::string,int> template_parameters;
     // Step4 floating-point regions remain atomic. Step5 integer templates may
     // opt into declared legal groups; only those groups can be split.
     bool internal_split_enabled = false;

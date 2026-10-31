@@ -138,6 +138,8 @@ CompileResult compileSource(const CompileOptions& options, OutputKind output_kin
     config.pipeline->register_stages = options.register_stages;
     config.pipeline->use_simple_cost = options.use_simple_cost;
     config.arithmetic_candidate = options.arithmetic_candidate;
+    config.arithmetic_request = options.arithmetic_request;
+    config.pipeline->arithmetic_request = options.arithmetic_request;
     config.pipeline->clock_name = options.clock_name;
     config.pipeline->input_valid_name = options.input_valid_name;
     config.pipeline->output_valid_name = options.output_valid_name;
@@ -176,6 +178,8 @@ CompileResult compileSource(const CompileOptions& options, OutputKind output_kin
     if (!result.ok()) {
         CompileResult out;
         out.error = result.error;
+        out.arithmetic_diagnostic = result.arithmetic_diagnostic;
+        out.arithmetic_report = result.arithmetic_report;
         out.error_debug_text = result.error_debug_text;
         out.error_debug_codelines = result.error_debug_text.empty()
             ? std::vector<std::string>{}
@@ -191,6 +195,8 @@ CompileResult compileSource(const CompileOptions& options, OutputKind output_kin
     CompileResult out;
     out.output_codelines = splitCodeLines(result.output_text);
     out.pipeline_report = result.pipeline_report;
+    out.arithmetic_diagnostic = result.arithmetic_diagnostic;
+    out.arithmetic_report = result.arithmetic_report;
     out.debug_text = result.rtl_debug_text;
     out.debug_codelines = result.rtl_debug_text.empty()
         ? std::vector<std::string>{}
