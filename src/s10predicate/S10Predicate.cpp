@@ -185,6 +185,8 @@ std::string opName(S10OpKind kind) {
     case S10OpKind::Add: return "Add";
     case S10OpKind::Sub: return "Sub";
     case S10OpKind::Mul: return "Mul";
+    case S10OpKind::Div: return "Div";
+    case S10OpKind::Mod: return "Mod";
     case S10OpKind::Neg: return "Neg";
     case S10OpKind::BitNot: return "BitNot";
     case S10OpKind::LogicalNot: return "LogicalNot";

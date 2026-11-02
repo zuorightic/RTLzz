@@ -148,6 +148,8 @@ std::string opName(S9OpKind kind) {
     case S9OpKind::Add: return "Add";
     case S9OpKind::Sub: return "Sub";
     case S9OpKind::Mul: return "Mul";
+    case S9OpKind::Div: return "Div";
+    case S9OpKind::Mod: return "Mod";
     case S9OpKind::Neg: return "Neg";
     case S9OpKind::BitNot: return "BitNot";
     case S9OpKind::LogicalNot: return "LogicalNot";

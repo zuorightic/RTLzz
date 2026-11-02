@@ -9,7 +9,7 @@ inline constexpr const char* kBackendContract = "native-beir-contract-v1";
 // One static contract shared by expansion, normalization, cost and materialization.
 void validate(const Program&, const std::string& phase, bool circt = false, const std::vector<std::string>& auxiliary_ports = {});
 Program normalizeSelections(Program);
-Program registerOriginalMultipliers(Program);
+Program registerOriginalOperators(Program);
 int billingWidth(const Program&, const Operand&);
 struct CostContext {
     std::string target_platform, platform_profile_sha256;

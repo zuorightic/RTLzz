@@ -93,6 +93,8 @@ std::string opKindName(S10OpKind kind) {
     case S10OpKind::Add: return "add";
     case S10OpKind::Sub: return "sub";
     case S10OpKind::Mul: return "mul";
+    case S10OpKind::Div: return "udiv";
+    case S10OpKind::Mod: return "umod";
     case S10OpKind::Neg: return "neg";
     case S10OpKind::BitNot: return "bit_not";
     case S10OpKind::LogicalNot: return "logical_not";
@@ -569,6 +571,8 @@ struct Builder {
         case S10OpKind::Add: return beir::OpCode::Add;
         case S10OpKind::Sub: return beir::OpCode::Sub;
         case S10OpKind::Mul: return beir::OpCode::Mul;
+        case S10OpKind::Div: return beir::OpCode::Div;
+        case S10OpKind::Mod: return beir::OpCode::Mod;
         case S10OpKind::BitAnd: return beir::OpCode::BitAnd;
         case S10OpKind::BitOr: return beir::OpCode::BitOr;
         case S10OpKind::BitXor: return beir::OpCode::BitXor;
@@ -605,6 +609,8 @@ struct Builder {
         case S10OpKind::Add:
         case S10OpKind::Sub:
         case S10OpKind::Mul:
+        case S10OpKind::Div:
+        case S10OpKind::Mod:
         case S10OpKind::BitAnd:
         case S10OpKind::BitOr:
         case S10OpKind::BitXor:
@@ -665,6 +671,8 @@ struct Builder {
             op.op = binaryOp(source.kind);
             if (op.op == beir::OpCode::Mul)
                 op.arithmetic_origin = output.function_name + "/mul/" + std::to_string(integer_occurrence++);
+            else if(op.op==beir::OpCode::Div||op.op==beir::OpCode::Mod)
+                op.arithmetic_origin=output.function_name+(op.op==beir::OpCode::Div?"/udiv/":"/umod/")+std::to_string(integer_occurrence++);
         } else if (isUnaryKind(source.kind)) {
             op.kind = beir::OperationKind::Unary;
             op.op = unaryOp(source.kind);

@@ -26,6 +26,10 @@ void canonicalizeSymbolNames(Program& p) {
     auto fix=[&](Operand& v) {if(v.kind==OperandKind::Symbol) v.text=p.signal(v.node).name;};
     for(auto& s:p.signals) if(s.driver) for(auto& v:s.driver->operands) fix(v);
     for(auto& r:p.arithmetic_regions) for(auto& v:r.inputs) fix(v);
+    // Component optimization uses temporary C++-safe port names. Restore the
+    // actual external port identity when assembling the original interface.
+    for(const auto& port:p.ports)if(port.direction==PortDirection::Input)
+        for(auto id:port.element_nodes){auto& s=p.signal(id);if(s.driver&&s.driver->kind==OperationKind::PortRead&&s.driver->operands.size()==1)s.driver->operands[0].text=port.name;}
 }
 std::vector<int> owners(const Program& p) {
     std::vector<int> o(p.signals.size(),0);

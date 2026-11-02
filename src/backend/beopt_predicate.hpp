@@ -1328,9 +1328,14 @@ inline bool sinkPredicates(MutableProgram& graph,
                         break;
                     }
                 } else if (consumer.kind == OperationKind::Case ||
-                           consumer.kind == OperationKind::Call) {
+                           consumer.kind == OperationKind::Call ||
+                           (consumer.kind==OperationKind::Binary &&
+                            (consumer.op==OpCode::Div||consumer.op==OpCode::Mod))) {
                     // Case needs its own boundary semantics. Unknown calls are
                     // not assumed to be side-effect-free combination logic.
+                    // Div/Mod evaluate their denominator at every pipeline
+                    // boundary and during reset, even when a downstream mux
+                    // discards the value. Preserve its total safe-divisor cone.
                     blocked = true;
                     break;
                 } else if (visited[use.consumer] != generation) {

@@ -21,6 +21,46 @@ std::uint64_t elements(const ValueType& t) {
     std::uint64_t n=1;for(int d:t.array_dims){if(d<=0 || n>UINT64_MAX/static_cast<unsigned>(d))bad("graph_validation","width_contract_violation","invalid/overflowed shape");n*=d;}return n;
 }
 bool scalar(const ValueType& t){return !t.isArray();}
+Operand unsignedAlias(const Program& p,Operand v){
+    std::set<NodeId> seen;
+    while(v.kind==OperandKind::Symbol&&v.node<p.signals.size()&&seen.insert(v.node).second){
+        const auto& s=p.signal(v.node);if(!s.driver)break;const auto& d=*s.driver;
+        if((d.kind!=OperationKind::Assign&&d.kind!=OperationKind::Cast&&d.kind!=OperationKind::ZExt)||d.operands.size()!=1||d.operands[0].type.width>v.type.width||v.signed_view||d.operands[0].signed_view)break;
+        v=d.operands[0];
+    }return v;
+}
+bool lowBitsNonzero(const std::vector<std::uint64_t>& words,int width){
+    for(int i=0;i<width;i+=64){
+        const auto k=static_cast<std::size_t>(i/64);if(k>=words.size())break;
+        const int bits=std::min(64,width-i);
+        const auto mask=bits==64?UINT64_MAX:(std::uint64_t(1)<<bits)-1;
+        if(words[k]&mask)return true;
+    }return false;
+}
+bool nonzeroDivisor(const Program& p,Operand value,int retained_width,std::set<NodeId> seen={}){
+    // Ite/aliases are evaluated modulo their result width. Carry the number
+    // of surviving low bits through nested selects; high nonzero bits are
+    // not a certificate for a narrower denominator.
+    retained_width=std::min(retained_width,value.type.width);
+    value=unsignedAlias(p,value);
+    retained_width=std::min(retained_width,value.type.width);
+    if(value.kind==OperandKind::Literal)return lowBitsNonzero(value.constant.limbs,retained_width);
+    if(value.kind!=OperandKind::Symbol||value.node>=p.signals.size()||!seen.insert(value.node).second)return false;
+    const auto& s=p.signal(value.node);
+    if(s.value.valid&&lowBitsNonzero(s.value.known_one,retained_width))return true;
+    if(!s.driver)return false;const auto& d=*s.driver;
+    if(d.kind!=OperationKind::Ite||d.operands.size()!=3)return false;
+    if(nonzeroDivisor(p,d.operands[1],retained_width,seen)&&nonzeroDivisor(p,d.operands[2],retained_width,seen))return true;
+    auto predicate=unsignedAlias(p,d.operands[0]);if(predicate.kind!=OperandKind::Symbol||predicate.node>=p.signals.size()||!p.signal(predicate.node).driver)return false;
+    const auto& condition=*p.signal(predicate.node).driver;
+    if(condition.kind!=OperationKind::Binary||(condition.op!=OpCode::Eq&&condition.op!=OpCode::Ne)||condition.operands.size()!=2)return false;
+    Operand tested;bool found=false;
+    for(int i=0;i<2;++i){auto zero=unsignedAlias(p,condition.operands[1-i]);if(zero.kind==OperandKind::Literal&&zero.constant.isZero()){tested=unsignedAlias(p,condition.operands[i]);found=true;break;}}
+    if(!found)return false;const int nonzero_branch=condition.op==OpCode::Eq?2:1;
+    auto branch=unsignedAlias(p,d.operands[nonzero_branch]);
+    bool same=tested.kind==OperandKind::Symbol&&branch.kind==OperandKind::Symbol&&tested.node==branch.node&&sameType(tested.type,branch.type);
+    return same&&tested.type.width<=retained_width&&nonzeroDivisor(p,d.operands[3-nonzero_branch],retained_width,seen);
+}
 }
 void validate(const Program& p,const std::string& phase,bool circt,const std::vector<std::string>& auxiliary_ports) {
     auto fail=[&](const std::string& code,const std::string& text,NodeId id){
@@ -67,6 +107,8 @@ void validate(const Program& p,const std::string& phase,bool circt,const std::ve
         case OperationKind::Binary:
             count(2);if(d.op<OpCode::Add || d.op>OpCode::Shr)fail("unsupported_backend_op","unsupported binary opcode",id);
             need(scalar(s.type)&&scalar(v[0].type)&&scalar(v[1].type),"binary scalar shape");
+            if((d.op==OpCode::Div||d.op==OpCode::Mod)&&phase!="candidate_materialization"&&phase!="materialized_graph"&&!nonzeroDivisor(p,v[1],v[1].type.width))
+                fail("unsafe_divisor","unsigned division requires a statically proven nonzero divisor or defined safe-divisor wrapper",id);
             if(d.op>=OpCode::LogicAnd && d.op<=OpCode::Ge)need(s.type.width==1,"boolean result width");break;
         case OperationKind::Unary:
             count(1);if(d.op<OpCode::LogicNot || d.op>OpCode::Neg)fail("unsupported_backend_op","unsupported unary opcode",id);
@@ -135,11 +177,14 @@ void validate(const Program& p,const std::string& phase,bool circt,const std::ve
     try{regions::validate(p);}catch(const std::exception& e){bad(phase,"invalid_expansion_graph",e.what());}
     for(const auto& r:p.arithmetic_regions) {
         auto reject=[&](const std::string& message){throw rtlzz::ArithmeticError({phase,"invalid_expansion_graph",message,r.id,{}});};
-        if(r.template_version=="mul-original-v1") {
-            if(r.operation!="mul_unsigned"||r.semantics!="unsigned-mod-result-v2"||r.internal_split_enabled||r.members.size()!=1||r.outputs!=r.members||r.inputs.size()!=2)
-                reject("malformed original Mul region contract");
+        if(r.template_version=="mul-original-v1"||r.template_version=="udiv-original-v1"||r.template_version=="umod-original-v1") {
+            const auto expected_op=r.template_version=="mul-original-v1"?OpCode::Mul:r.template_version=="udiv-original-v1"?OpCode::Div:OpCode::Mod;
+            const auto operation=expected_op==OpCode::Mul?"mul_unsigned":expected_op==OpCode::Div?"div_unsigned":"mod_unsigned";
+            const auto semantics=expected_op==OpCode::Mul?"unsigned-mod-result-v2":"unsigned-nonzero-divisor-v1";
+            if(r.operation!=operation||r.semantics!=semantics||r.internal_split_enabled||r.members.size()!=1||r.outputs!=r.members||r.inputs.size()!=2)
+                reject("malformed original integer region contract");
             const auto& op=*p.signal(r.members[0]).driver;
-            if(op.kind!=OperationKind::Binary||op.op!=OpCode::Mul)reject("original Mul region lost its operation");
+            if(op.kind!=OperationKind::Binary||op.op!=expected_op)reject("original integer region lost its operation");
             const std::map<std::string,int> expected{{"lhs_width",billingWidth(p,op.operands[0])},{"rhs_width",billingWidth(p,op.operands[1])},{"result_width",p.signal(r.outputs[0]).type.width}};
             if(r.template_parameters!=expected)reject("Mul template width provenance mismatch");
             for(std::size_t k=0;k<2;++k) {
@@ -249,14 +294,14 @@ CostEstimate CostProvider::estimateGroup(const Program& p,const std::vector<Node
         if(total.combinational>UINT64_MAX-c.combinational)bad("cost","cost_uncovered","area overflow");total.combinational+=c.combinational;visiting.erase(id);return cache[id]=before+c.delay;};
     for(auto id:members)total.delay=std::max(total.delay,arrival(id));return total;
 }
-Program registerOriginalMultipliers(Program p) {
+Program registerOriginalOperators(Program p) {
     std::set<NodeId> owned;for(const auto& r:p.arithmetic_regions)owned.insert(r.members.begin(),r.members.end());
     const auto size=p.signals.size();for(NodeId id=0;id<size;++id) {
         if(owned.count(id)||!p.signal(id).driver)continue;auto op=*p.signal(id).driver;
-        if(op.kind!=OperationKind::Binary||op.op!=OpCode::Mul)continue;
+        if(op.kind!=OperationKind::Binary||(op.op!=OpCode::Mul&&op.op!=OpCode::Div&&op.op!=OpCode::Mod))continue;
         for(const auto& v:op.operands)if(v.signed_view||v.constant.signed_view)bad("expansion","template_ineligible","unsigned core cannot register signed multiplication",id);
         if(op.arithmetic_origin.empty())bad("expansion","template_ineligible","Mul has no stable pre-optimization semantic occurrence",id);
-        ArithmeticRegion r;r.id=op.arithmetic_origin;r.operation="mul_unsigned";r.semantics="unsigned-mod-result-v2";r.template_version="mul-original-v1";r.sharing_policy="post-BEOPT-original-atomic-v1";r.inputs=op.operands;
+        ArithmeticRegion r;r.id=op.arithmetic_origin;r.operation=op.op==OpCode::Mul?"mul_unsigned":op.op==OpCode::Div?"div_unsigned":"mod_unsigned";r.semantics=op.op==OpCode::Mul?"unsigned-mod-result-v2":"unsigned-nonzero-divisor-v1";r.template_version=op.op==OpCode::Mul?"mul-original-v1":op.op==OpCode::Div?"udiv-original-v1":"umod-original-v1";r.sharing_policy="post-BEOPT-original-atomic-v1";r.inputs=op.operands;
         r.template_parameters={{"lhs_width",billingWidth(p,op.operands[0])},{"rhs_width",billingWidth(p,op.operands[1])},{"result_width",p.signal(id).type.width}};
         Signal member=p.signal(id);member.id=p.signals.size();member.name="arith_original_"+std::to_string(member.id);member.port_name.clear();member.port_element_index=-1;member.debug.derived_nodes.clear();r.members={member.id};r.outputs=r.members;p.signals.push_back(member);
         Operation alias;alias.type=p.signal(id).type;alias.operands={ref(p,member.id)};p.signal(id).driver=alias;p.signal(id).value={};p.arithmetic_regions.push_back(r);

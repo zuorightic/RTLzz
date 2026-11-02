@@ -877,8 +877,11 @@ Value normalizeBinary(Context& ctx,
                              op.debug_loc);
         }
         auto divisor = literalUInt64(rhs);
-        if (!divisor) {
-            fail("Div/Mod are only supported when the second operand is a constant", op.debug_loc);
+        if (!divisor || (lhs.type.width>64 && *divisor!=0 && lhs.type.width==rhs.type.width)) {
+            if(lhs.type.width!=rhs.type.width || target_type.width!=lhs.type.width)
+                fail("Dynamic unsigned Div/Mod require equal operand and result widths",op.debug_loc);
+            return materializeOp(ctx,op.binary_op==S7BinaryOp::Div?S8OpKind::Div:S8OpKind::Mod,
+                                 target_type,{std::move(lhs),std::move(rhs)},out,op.debug_loc,"udivmod");
         }
         if (op.binary_op == S7BinaryOp::Div) {
             return lowerUnsignedDivConst(ctx, std::move(lhs), *divisor, out, op.debug_loc);
@@ -1392,6 +1395,8 @@ std::string opName(S8OpKind kind) {
     case S8OpKind::Add: return "Add";
     case S8OpKind::Sub: return "Sub";
     case S8OpKind::Mul: return "Mul";
+    case S8OpKind::Div: return "Div";
+    case S8OpKind::Mod: return "Mod";
     case S8OpKind::Neg: return "Neg";
     case S8OpKind::BitNot: return "BitNot";
     case S8OpKind::LogicalNot: return "LogicalNot";

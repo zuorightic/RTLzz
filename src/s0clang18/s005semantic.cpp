@@ -72,7 +72,8 @@ bool hasMainFileLocation(const Clang18Session& session, const clang::Decl* decl)
     // Do not make arbitrary library functions part of the source program.
     const auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl);
     if (!function) function = llvm::dyn_cast_or_null<clang::FunctionDecl>(decl->getDeclContext());
-    if (function && function->getQualifiedNameAsString() == "vularith::F32MulRNEBody") return true;
+    if (function && (function->getQualifiedNameAsString() == "vularith::F32MulRNEBody" ||
+                     function->getQualifiedNameAsString() == "vularith::UDivRemShared")) return true;
     clang::SourceLocation loc = decl->getLocation();
     if (loc.isInvalid()) loc = decl->getBeginLoc();
     if (loc.isInvalid()) return false;

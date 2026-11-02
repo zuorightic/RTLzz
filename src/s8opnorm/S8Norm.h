@@ -125,6 +125,9 @@ enum class S8OpKind {
     ReduceOr,
     ReduceAnd,
     ReduceXor,
+    // Appended to preserve the existing normalized-op numeric identities.
+    Div,
+    Mod,
 };
 
 struct S8Operation {

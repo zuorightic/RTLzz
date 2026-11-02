@@ -591,7 +591,7 @@ PipelineResult compile(const PipelineConfig& config) {
         if(config.arithmetic_request) {
             beir::arithmetic::validate(beir_program,"expanded_graph",config.use_circt);
             beir_program=beir::arithmetic::normalizeSelections(std::move(beir_program));
-            beir_program=beir::arithmetic::registerOriginalMultipliers(std::move(beir_program));
+            beir_program=beir::arithmetic::registerOriginalOperators(std::move(beir_program));
             beir::arithmetic::validate(beir_program,"normalized_graph",config.use_circt);
         }
         PipelineResult result;
