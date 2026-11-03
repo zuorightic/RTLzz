@@ -8,16 +8,19 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <vector>
 using namespace pred;namespace fs=std::filesystem;
 static unsigned checks=0;
 #define CHECK(x) do{++checks;if(!(x)){std::cerr<<__LINE__<<": "<<#x<<"\n";return 1;}}while(false)
 static std::string read(const fs::path&p){std::ifstream f(p);return {std::istreambuf_iterator<char>(f),{}};}
-int main(int argc,char**argv){CHECK(argc==4);fs::path root=argv[1],models=argv[2],out=argv[3];fs::create_directories(out);
- for(const std::string platform:{"asap7","nangate45","sky130hd","gf180"}){
+int main(int argc,char**argv){CHECK(argc>=4);fs::path root=argv[1],models=argv[2],out=argv[3];fs::create_directories(out);
+ std::vector<std::string> platforms={"asap7","nangate45","sky130hd","gf180"};
+ if(argc>4)platforms.assign(argv+4,argv+argc);
+ for(const std::string& platform:platforms){
   rtlzz::ArithmeticRequest r;r.target_platform=platform;r.platform_profile=(root/"experiments/arithmetic_dse/configs/platforms"/(platform+".json")).string();r.platform_profile_sha256=rtlzz::arithmeticHash(read(r.platform_profile));r.cost_mode="backend-model";r.model_bundle=(models/(platform+".json")).string();r.model_bundle_sha256=rtlzz::arithmeticHash(read(r.model_bundle));r.candidate_policy="mul-candidates-v1";r.latency=3;
   auto model=llvm::json::parse(read(r.model_bundle));CHECK(static_cast<bool>(model));r.target_period_ps=*model->getAsObject()->getNumber("mapping_abc_target_ps");
   pipelinev2::PipelineConfig c;c.source_name="model-joint-source.logic.cpp";c.source_text="#include <fixint.hpp>\nInt<8> a,b;Int<16> y;bool iv,ov;\n#pragma input_port a\n#pragma input_port b\n#pragma input_port iv\n#pragma output_port y\n#pragma output_port ov\nvoid top(){y=a*b;}\n";c.top_function="top";c.clang_args={"-std=c++20","-I"+(root/"vullib").string()};c.use_circt=false;c.arithmetic_request=r;c.pipeline.emplace();c.pipeline->register_stages=2;c.pipeline->reset_enabled=true;c.pipeline->input_valid_name="iv";c.pipeline->output_valid_name="ov";c.pipeline->input_reset_values={{"a",{0}},{"b",{0}},{"iv",{0}}};
-  auto result=pipelinev2::compile(c);if(!result.ok())std::cerr<<result.error<<result.arithmetic_report;CHECK(result.ok());CHECK(result.pipeline_program);pipeline::validateProgram(*result.pipeline_program);
+  auto result=pipelinev2::compile(c);std::ofstream(out/(platform+".report.json"))<<result.arithmetic_report;if(!result.ok())std::cerr<<result.error<<result.arithmetic_report;CHECK(result.ok());CHECK(result.pipeline_program);pipeline::validateProgram(*result.pipeline_program);
   auto report=llvm::json::parse(result.arithmetic_report);CHECK(static_cast<bool>(report));auto selection=report->getAsObject()->getObject("selection");CHECK(selection);CHECK(selection->getBoolean("formal_D_selection")==true);CHECK(selection->getBoolean("candidate_model_coverage_complete")==true);CHECK(selection->getInteger("evaluated_structures")==3);CHECK(selection->getInteger("candidate_PPA_calls")==0);
   std::ofstream(out/(platform+".report.json"))<<result.arithmetic_report;std::ofstream(out/(platform+".sv"))<<result.output_text;
   auto candidates=selection->getArray("candidates");CHECK(candidates);
