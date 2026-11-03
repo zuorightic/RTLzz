@@ -342,29 +342,33 @@ Program normalizeSelections(Program p) {
     }
     p.temp_names_initialized=false;validate(p,"post_normalization");return p;
 }
-std::string report(const Program& p,const rtlzz::ArithmeticRequest& request,const rtlzz::PipelineReport* schedule,const std::vector<int>& stages,const std::string& rtl,const pipeline::Options* settings) {
+std::string report(const Program& p,const rtlzz::ArithmeticRequest& request,const rtlzz::PipelineReport* schedule,const std::vector<int>& stages,const std::string& rtl,const pipeline::Options* settings,bool selected) {
     using namespace llvm::json;
-    FixedCostProvider costs(costContext(request));Array nodes,regionsJson;
+    auto costs=makeCostProvider(p,request);const bool model=request.cost_mode=="backend-model";Array nodes,regionsJson;
     for(const auto& s:p.signals) {
         Array operands;for(const auto& v:s.driver->operands) {
             Array dims;for(int dim:v.type.array_dims)dims.push_back(dim);Array limbs;for(auto word:v.constant.limbs)limbs.push_back(std::to_string(word));
             operands.push_back(Object{{"kind",static_cast<int>(v.kind)},{"node",v.kind==OperandKind::Symbol?std::to_string(v.node):""},{"width",v.type.width},{"signed",v.signed_view},{"constant_signed",v.constant.signed_view},{"constant_width",v.constant.width},{"dims",std::move(dims)},{"limbs",std::move(limbs)}});
         }
         Array dims;for(int dim:s.type.array_dims)dims.push_back(dim);
-        auto cost=costs.node(p,s.id);
+        auto cost=costs->node(p,s.id);
+        Object physicalFeatures;for(const auto& [key,value]:cost.physical_features)
+            physicalFeatures[key]=(key=="log_width"||key=="abc_target_ps"||key=="sdc_period_ps")?Value(value):Value(static_cast<std::int64_t>(value));
+        if(!cost.physical_operation.empty()){physicalFeatures["literal_operands"]=false;physicalFeatures["known_one_operands"]=false;
+            physicalFeatures["constant_carry"]=false;physicalFeatures["correlated_operands"]=false;}
         nodes.push_back(Object{{"id",std::to_string(s.id)},{"kind",static_cast<int>(s.driver->kind)},{"opcode",static_cast<int>(s.driver->op)},
-            {"width",s.type.width},{"dims",std::move(dims)},{"hi",s.driver->hi},{"lo",s.driver->lo},{"bit",s.driver->bit},{"times",s.driver->times},{"to_width",s.driver->to_width},{"signed_truncation",s.driver->signed_truncation},{"operands",std::move(operands)},{"billing_width",cost.billing_width},{"delay",cost.delay},{"comb",static_cast<std::int64_t>(cost.combinational)},
-            {"covered",cost.covered},{"transaction_constant",s.value.valid&&s.value.constant},{"cost_source",cost.source}});
+            {"width",s.type.width},{"dims",std::move(dims)},{"hi",s.driver->hi},{"lo",s.driver->lo},{"bit",s.driver->bit},{"times",s.driver->times},{"to_width",s.driver->to_width},{"signed_truncation",s.driver->signed_truncation},{"operands",std::move(operands)},{"billing_width",cost.billing_width},{"delay",cost.delay},{"comb",model?Value(cost.combinational):Value(static_cast<std::int64_t>(cost.combinational))},
+            {"covered",cost.covered},{"deferred_to_stage",cost.deferred_to_stage},{"query_status",model?(cost.deferred_to_stage?"deferred_to_validated_template_stage":"predicted_in_domain"):"static_abstract"},{"transaction_constant",s.value.valid&&s.value.constant},{"cost_source",cost.source},{"physical_operation",cost.physical_operation},{"physical_features",std::move(physicalFeatures)}});
     }
     for(const auto& r:p.arithmetic_regions) {
         Array members,inputs,outputs,groups;for(auto n:r.members)members.push_back(std::to_string(n));for(auto n:r.outputs)outputs.push_back(std::to_string(n));
         for(const auto& v:r.inputs){Array limbs;for(auto word:v.constant.limbs)limbs.push_back(std::to_string(word));inputs.push_back(Object{{"node",v.kind==OperandKind::Symbol?std::to_string(v.node):"literal"},{"width",v.type.width},{"billing_width",billingWidth(p,v)},{"signed_view",v.signed_view},{"constant_signed",v.constant.signed_view},{"constant_width",v.constant.width},{"constant_limbs",std::move(limbs)}});}
         for(const auto& g:r.legal_cut_groups){Array ids;for(auto n:g)ids.push_back(std::to_string(n));groups.push_back(std::move(ids));}
-        auto cost=costs.group(p,r.members);Object parameters;for(const auto& kv:r.template_parameters)parameters[kv.first]=kv.second;
+        auto cost=costs->group(p,r.members);Object parameters;for(const auto& kv:r.template_parameters)parameters[kv.first]=kv.second;
         regionsJson.push_back(Object{{"id",r.id},{"operation",r.operation},{"semantic_version",r.semantics},{"template_id",r.template_version},{"parameters",std::move(parameters)},
             {"sharing_policy",r.sharing_policy},{"members",std::move(members)},{"inputs",std::move(inputs)},{"outputs",std::move(outputs)},{"legal_groups",std::move(groups)},
-            {"generated",true},{"numerically_validated_by_this_compile",false},{"internally_cuttable",r.internal_split_enabled},{"C_selected",request.candidate_policy=="mul-candidates-v1"},{"D_covered",false},{"D_selected",false},{"physically_evaluated",false},
-            {"delay",cost.delay},{"comb",static_cast<std::int64_t>(cost.combinational)}});
+            {"generated",true},{"numerically_validated_by_this_compile",false},{"internally_cuttable",r.internal_split_enabled},{"C_selected",selected&&!model&&request.candidate_policy=="mul-candidates-v1"},{"D_covered",model},{"D_selected",selected&&model&&request.candidate_policy=="mul-candidates-v1"},{"physically_evaluated",false},
+            {"delay",cost.delay},{"comb",model?Value(cost.combinational):Value(static_cast<std::int64_t>(cost.combinational))}});
     }
     Array ports;for(const auto& port:p.ports){Array dims,ids;for(int dim:port.type.array_dims)dims.push_back(dim);for(auto id:port.element_nodes)ids.push_back(std::to_string(id));ports.push_back(Object{{"name",port.name},{"direction",static_cast<int>(port.direction)},{"width",port.type.width},{"dims",std::move(dims)},{"nodes",std::move(ids)}});}
     Object graph{{"nodes",std::move(nodes)},{"regions",std::move(regionsJson)},{"ports",std::move(ports)}};
@@ -378,14 +382,29 @@ std::string report(const Program& p,const rtlzz::ArithmeticRequest& request,cons
     Value protocolValue(std::move(protocol));Value scheduleValue(Object{{"stages",levelValue},{"protocol",protocolValue}});
     auto stageIdentity=llvm::formatv("{0}",scheduleValue).str();auto stageHash=rtlzz::arithmeticHash(graphHash+stageIdentity);
     Object result{{"version","arithmetic-structure-report-v2"},{"backend_contract",kBackendContract},{"status","passed"},{"graph",std::move(graphValue)},
+        {"selection_role",selected?"selected_implementation":"evaluated_candidate"},
         {"graph_identity_text",graphIdentity},{"schedule_identity_text",stageIdentity},{"graph_sha256",graphHash},{"schedule_sha256",stageHash},{"rtl_sha256",rtlzz::arithmeticHash(rtl)},{"stages",std::move(levelValue)},{"protocol",std::move(protocolValue)},
-        {"request",Object{{"target_platform",request.target_platform},{"platform_profile_sha256",request.platform_profile_sha256},{"cost_mode",request.cost_mode},{"cost_source","fixed-op-width-v1"},
-            {"cost_source_sha256",request.fixed_cost_table_sha256},{"model_bundle_sha256",request.model_bundle_sha256},{"candidate_policy",request.candidate_policy},{"semantic_profile",request.semantic_profile},
+        {"request",Object{{"target_platform",request.target_platform},{"platform_profile_sha256",request.platform_profile_sha256},{"cost_mode",request.cost_mode},{"cost_source",costs->modelIdentity()},
+            {"cost_source_sha256",model?request.model_bundle_sha256:request.fixed_cost_table_sha256},{"model_bundle_sha256",request.model_bundle_sha256},{"candidate_policy",request.candidate_policy},{"semantic_profile",request.semantic_profile},
             {"L",request.latency},{"II",request.initiation_interval},{"target_period_ps",request.target_period_ps}}},
-        {"delay_unit","abstract"},{"comb_unit","abstract"},{"state_unit","saved_bits"},{"D_inference_implemented",false},{"cost_query_context",Object{{"target_platform",costs.context().target_platform},{"platform_profile_sha256",costs.context().platform_profile_sha256},{"evaluation_stage",costs.context().evaluation_stage},{"feature_schema",costs.context().feature_schema},{"stage_index",costs.context().stage_index},{"model_bundle_sha256",costs.context().model_bundle_sha256}}},
-        {"capabilities",Object{{"original_unsigned_mul","generated; atomic"},{"binary32_mul_rne","generated; atomic"},{"mul_half_quarter","generated; legal reduction levels; request dependent selection"},{"backend_model","reserved_step7; requests fail closed"},{"AES_Sigmoid_fixedpoint","reserved; requests rejected"}}}};
+        {"delay_unit",model?"ps":"abstract"},{"comb_unit",model?"um2":"abstract"},{"state_unit","saved_bits"},{"D_inference_implemented",model},{"cost_query_context",Object{{"target_platform",costs->context().target_platform},{"platform_profile_sha256",costs->context().platform_profile_sha256},{"evaluation_stage",costs->context().evaluation_stage},{"feature_schema",costs->context().feature_schema},{"stage_index",costs->context().stage_index},{"model_bundle_sha256",costs->context().model_bundle_sha256}}},
+        {"capabilities",Object{{"original_unsigned_mul","generated; atomic"},{"binary32_mul_rne","generated; atomic"},{"mul_half_quarter","generated; legal reduction levels; request dependent selection"},{"backend_model","native portable offline inference; explicit validated domains only"},{"AES_Sigmoid_fixedpoint","reserved; requests rejected"}}}};
     if(schedule)result["pipeline"]=Object{{"baseline_delay",schedule->baseline_delay},{"allowed_delay",schedule->allowed_delay},{"final_delay",schedule->final_delay},{"comb",static_cast<std::int64_t>(schedule->combinational_cost)},
         {"register_bits",schedule->register_bits},{"register_count",static_cast<std::uint64_t>(schedule->register_count)}};
+    if(schedule&&model){
+        auto* physical=result.getObject("pipeline");
+        (*physical)["comb"]=schedule->predicted_comb_area_um2;
+        (*physical)["predicted_comb_area_um2"]=schedule->predicted_comb_area_um2;
+        (*physical)["predicted_state_area_um2"]=schedule->predicted_state_area_um2;
+        (*physical)["predicted_total_area_um2"]=schedule->predicted_total_area_um2;
+        (*physical)["model_state_bits"]=schedule->model_state_bits;
+        (*physical)["model_state_signals"]=static_cast<std::uint64_t>(schedule->model_state_signals);
+        (*physical)["input_data_budget_ps"]=schedule->input_data_budget_ps;
+        (*physical)["register_data_budget_ps"]=schedule->register_data_budget_ps;
+        (*physical)["predicted_feasible"]=schedule->model_feasible;
+        Array delays,caps;for(auto n:schedule->stage_delays)delays.push_back(n);for(auto n:schedule->allowed_stage_delays)caps.push_back(n);
+        (*physical)["stage_delays_ps"]=std::move(delays);(*physical)["allowed_stage_delays_ps"]=std::move(caps);
+    }
     return llvm::formatv("{0:2}",Value(std::move(result))).str()+"\n";
 }
 }

@@ -88,12 +88,17 @@ struct Graph {
     const beir::Program& p;
     int last;
     bool fixed_cost = false;
+    bool model_cost = false;
+    mutable bool uncovered_stage_attempt = false;
+    std::unique_ptr<beir::arithmetic::CostProvider> provider;
     NodeId valid_input = kInvalidNodeId, valid_output = kInvalidNodeId;
     std::vector<NodeId> order;
     std::vector<std::vector<NodeId>> users;
     std::vector<bool> live, input, output, constant;
     std::vector<double> costs;
     std::vector<std::uint64_t> areas;
+    std::vector<double> physical_areas;
+    std::vector<bool> stage_deferred;
     std::vector<NodeId> unit_order, unit_of;
     std::vector<std::vector<NodeId>> units;
     std::vector<std::string> unit_labels;
@@ -101,8 +106,13 @@ struct Graph {
     Graph(const beir::Program& program, const Options& options)
         : p(program), last(options.register_stages), users(p.signals.size()),
           live(p.signals.size()), input(live.size()), output(live.size()),
-          constant(live.size()), costs(live.size()), areas(live.size()) {
+          constant(live.size()), costs(live.size()), areas(live.size()),physical_areas(live.size()),stage_deferred(live.size()) {
         fixed_cost=options.arithmetic_request.has_value();
+        model_cost=options.arithmetic_request&&options.arithmetic_request->cost_mode=="backend-model";
+        if(options.arithmetic_request)provider=arithmetic::makeCostProvider(p,*options.arithmetic_request);
+        if(model_cost){provider->validateStateProtocol(options.reset_enabled,!options.input_valid_name.empty(),true);provider->validateInterface(p,options.output_valid_name);}
+        if(model_cost&&(provider->dataBudget(true)<=0||provider->dataBudget(false)<=0))
+            throw rtlzz::ArithmeticError({"scheduling","nonpositive_data_budget","target does not exceed model boundary/clock overhead in ps",{},{}});
         if (options.arithmetic_request) beir::arithmetic::validate(p,"cost_preflight");
         if (!p.arithmetic_regions.empty()) beir::regions::validate(p);
         for(const auto& r:p.arithmetic_regions) if(!r.internal_registers.empty())
@@ -205,24 +215,32 @@ struct Graph {
             for (const auto& v : op.operands)
                 if (v.kind != OperandKind::Literal &&
                     (v.kind != OperandKind::Symbol || !constant[v.node])) constant[id] = false;
-            auto fixed = options.arithmetic_request ? arithmetic::FixedCostProvider(arithmetic::costContext(*options.arithmetic_request)).node(p,id) : arithmetic::CostEstimate{};
+            if(model_cost&&constant[id])continue;
+            auto fixed = provider ? provider->node(p,id) : arithmetic::CostEstimate{};
             if(options.arithmetic_request && !fixed.covered) throw rtlzz::ArithmeticError({"cost","cost_uncovered",fixed.reason,{},std::to_string(id)});
             if (constant[id]) continue;
             auto k = key(op);
             if(options.arithmetic_request) {
-                costs[id]=fixed.delay;areas[id]=fixed.combinational;
+                stage_deferred[id]=fixed.deferred_to_stage;costs[id]=fixed.delay;if(model_cost)physical_areas[id]=fixed.combinational;else areas[id]=fixed.combinational;
             } else {
                 auto it = options.operation_delay_weights.find(k);
                 costs[id] = it != options.operation_delay_weights.end() ? it->second
                     : k == Key::Assign ? 0 : k == Key::Multiply ? 3 : 1;
             }
         }
+        if(model_cost&&std::none_of(costs.begin(),costs.end(),[](double value){return value>0;})&&std::none_of(stage_deferred.begin(),stage_deferred.end(),[](bool value){return value;}))
+            throw rtlzz::ArithmeticError({"cost","cost_uncovered","pure wiring/state-only application has no qualified arithmetic-stage model",{},{}});
     }
 
     // Earliest feasible placement under a cost cap, with output sinks fixed at N.
     bool schedule(double cap, std::vector<int>& stage, std::string* diagnostic=nullptr) const {
+        uncovered_stage_attempt=false;
         stage.assign(live.size(), 0);
         std::vector<double> arrival(live.size());
+        std::vector<double> stage_peak(last+1,0);
+        std::vector<std::size_t> stage_operations(last+1,0);
+        std::vector<std::uint64_t> stage_bits(last+1,0);
+        std::vector<std::vector<NodeId>> stage_members(last+1);
         for(auto u:unit_order) {
             int start=0; bool fixed=false;
             for(auto id:units[u]) {
@@ -235,6 +253,7 @@ struct Graph {
             double peak=0;
             for(int at=start;at<=last && at<=start+1;++at) {
                 bool fits=true;
+                double trial_peak=0;std::size_t operations=0;std::uint64_t value_bits=0;
                 for(auto id:units[u]) {
                     stage[id]=at;arrival[id]=0;
                     if(input[id]) { if(at) fits=false; continue; }
@@ -243,9 +262,20 @@ struct Graph {
                     for(const auto& v:p.signal(id).driver->operands)
                         if(v.kind==OperandKind::Symbol && !constant[v.node] && stage[v.node]==at)
                             a=std::max(a,arrival[v.node]);
-                    arrival[id]=a+costs[id];peak=std::max(peak,arrival[id]);if(arrival[id]>cap) fits=false;
+                    arrival[id]=a+costs[id];peak=std::max(peak,arrival[id]);trial_peak=std::max(trial_peak,arrival[id]);
+                    if(costs[id]>0||stage_deferred[id]){++operations;value_bits+=bits(p.signal(id).type);}
+                    if(!model_cost&&arrival[id]>cap) fits=false;
                 }
-                if(fits) {placed=true;break;}
+                const double limit=model_cost?std::min(cap,provider->dataBudget(at==0)):cap;
+                double corrected=trial_peak;
+                auto members=stage_members[at];members.insert(members.end(),units[u].begin(),units[u].end());
+                if(model_cost){
+                    bool covered=provider->stageCovered(stage_operations[at]+operations,stage_bits[at]+value_bits)&&provider->stageShapeCovered(members);
+                    if(!covered)uncovered_stage_attempt=true;
+                    corrected=covered?provider->stageDelay(std::max(stage_peak[at],trial_peak),stage_operations[at]+operations,stage_bits[at]+value_bits,members):std::numeric_limits<double>::infinity();
+                }
+                if(corrected>limit)fits=false;
+                if(fits) {stage_peak[at]=std::max(stage_peak[at],trial_peak);stage_operations[at]+=operations;stage_bits[at]+=value_bits;stage_members[at]=std::move(members);placed=true;break;}
                 if(fixed) break;
             }
             if(!placed) {
@@ -260,6 +290,23 @@ struct Graph {
 
     Report evaluate(const std::vector<int>& stage) const {
         Report r; r.stage_delays.assign(static_cast<std::size_t>(last) + 1, 0);
+        std::size_t max_state_width=0,min_variable_word=std::numeric_limits<std::size_t>::max();
+        auto variable_bits=[&](NodeId id){
+            const auto& s=p.signal(id);if(s.type.isArray())throw rtlzz::ArithmeticError({"cost","cost_uncovered","array state has no validated model",{},{}});
+            std::uint64_t variable=s.type.width;
+            if(s.value.valid)for(int bit=0;bit<s.type.width;++bit){auto word=static_cast<std::size_t>(bit/64);auto mask=std::uint64_t(1)<<(bit%64);
+                if((word<s.value.known_zero.size()&&(s.value.known_zero[word]&mask))||(word<s.value.known_one.size()&&(s.value.known_one[word]&mask)))--variable;
+            }return variable;
+        };
+        auto add_state=[&](NodeId id,std::uint64_t length,bool control){
+            if(!length)return;auto variable=variable_bits(id);if(!variable)return;
+            if(variable>(UINT64_MAX-r.model_state_bits)/length)throw rtlzz::ArithmeticError({"cost","cost_uncovered","variable state bit count overflow",{},{}});
+            r.model_state_bits+=variable*length;r.model_state_signals+=static_cast<std::size_t>(length);
+            if(!control){max_state_width=std::max(max_state_width,static_cast<std::size_t>(p.signal(id).type.width));min_variable_word=std::min(min_variable_word,static_cast<std::size_t>(variable));}
+        };
+        std::vector<std::size_t> stage_operations(last+1,0);std::vector<std::uint64_t> stage_bits(last+1,0);
+        std::vector<double> stage_areas(last+1,0);
+        std::vector<std::vector<NodeId>> stage_members(last+1);
         std::vector<double> arrival(live.size());
         for (auto u : unit_order) for (auto id : units[u]) if (stage[id] != stage[units[u].front()]) {
             r.final_delay = std::numeric_limits<double>::infinity(); return r;
@@ -271,6 +318,7 @@ struct Graph {
             }
             const auto& s = p.signal(id);
             if (constant[id] || input[id]) continue;
+            stage_members[stage[id]].push_back(id);
             double a = 0;
             for (const auto& v : s.driver->operands) {
                 if (v.kind != OperandKind::Symbol || constant[v.node]) continue;
@@ -281,12 +329,14 @@ struct Graph {
             }
             arrival[id] = a + costs[id];
             r.stage_delays[stage[id]] = std::max(r.stage_delays[stage[id]], arrival[id]);
+            if(costs[id]>0||stage_deferred[id]){++stage_operations[stage[id]];stage_bits[stage[id]]+=bits(s.type);}
         }
         for (auto id : order) {
             if (constant[id]) continue;
             if (!input[id] && areas[id] > UINT64_MAX - r.combinational_cost)
                 throw std::runtime_error("pipeline: combinational cost overflow");
             if(!input[id]) r.combinational_cost += areas[id];
+            if(!input[id]){r.predicted_comb_area_um2+=physical_areas[id];stage_areas[stage[id]]+=physical_areas[id];}
             int end = stage[id];
             for (auto user : users[id]) end = std::max(end, stage[user]);
             if (id == valid_input) end = last; // Dedicated chain, independent of data consumers.
@@ -296,8 +346,21 @@ struct Graph {
                 throw std::runtime_error("pipeline: register bit count overflow");
             r.register_bits += width * length;
             r.register_count += static_cast<std::size_t>(length);
+            if(model_cost)add_state(id,length,id==valid_input);
         }
         if(fixed_cost) r.cost_model="fixed-op-width-v1";
+        if(model_cost){
+            r.predicted_comb_area_um2=0;
+            r.cost_model=provider->modelIdentity();r.input_data_budget_ps=provider->dataBudget(true);r.register_data_budget_ps=provider->dataBudget(false);r.model_feasible=true;
+            for(int at=0;at<=last;++at){
+                if(!provider->stageCovered(stage_operations[at],stage_bits[at])||!provider->stageShapeCovered(stage_members[at])){r.final_delay=std::numeric_limits<double>::infinity();r.model_feasible=false;return r;}
+                r.stage_delays[at]=provider->stageDelay(r.stage_delays[at],stage_operations[at],stage_bits[at],stage_members[at]);if(r.stage_delays[at]>provider->dataBudget(at==0))r.model_feasible=false;
+                r.predicted_comb_area_um2+=provider->stageArea(stage_areas[at],stage_operations[at],stage_bits[at],stage_members[at]);
+            }
+            for(const auto& port:p.ports)if(port.direction==PortDirection::Output)for(auto id:port.element_nodes)add_state(id,1,id==valid_output);
+            r.predicted_state_area_um2=provider->stateArea(r.model_state_bits,r.model_state_signals,max_state_width,min_variable_word);
+            r.predicted_total_area_um2=r.predicted_comb_area_um2+r.predicted_state_area_um2;
+        }
         r.final_delay = *std::max_element(r.stage_delays.begin(), r.stage_delays.end());
         return r;
     }
@@ -386,7 +449,7 @@ Program build(const beir::Program& program, const Options& options) {
             result.report=graph.evaluate(result.stages);
             result.report.baseline_delay=result.report.final_delay;
             result.report.allowed_delay=result.report.final_delay*105.0/100.0;
-            result.report.cost_model="fixed-op-width-v1";
+            if(!graph.model_cost)result.report.cost_model="fixed-op-width-v1";
         }
         result.initial_stages=result.stages;
         return result;
@@ -412,16 +475,41 @@ Program build(const beir::Program& program, const Options& options) {
         }
         connect_valid_output();
         initializeResetValues(result);
+        if(g.model_cost){bool zero=true;for(const auto& [name,words]:result.report.output_reset_values)for(auto v:words)zero&=v==0;g.provider->validateStateProtocol(options.reset_enabled,!options.input_valid_name.empty(),zero);}
         result.initial_stages=result.stages;
         return result;
     }
     double upper = 0, lower = 0;
+    std::size_t all_operations=0;std::uint64_t all_bits=0;
     for (auto id : g.order) {
         upper += g.costs[id]; lower = std::max(lower, g.costs[id]);
+        if(g.costs[id]>0||g.stage_deferred[id]){++all_operations;all_bits+=bits(normalized.signal(id).type);}
+    }
+    if(g.model_cost){
+        lower=0; // A fitted stage scale can reduce the raw node-path proxy.
+        if(g.provider->dataBudget(true)<=0||g.provider->dataBudget(false)<=0)
+            throw rtlzz::ArithmeticError({"scheduling","nonpositive_data_budget","target does not exceed declared boundary/clock overhead in ps",{},{}});
+        const double available=g.last?std::max(g.provider->dataBudget(true),g.provider->dataBudget(false)):g.provider->dataBudget(true);
+        for(auto u:g.unit_order){double longest=0;std::size_t ops=0;std::uint64_t value_bits=0;std::vector<double> arrivals(normalized.signals.size());
+            for(auto id:g.units[u]){double a=0;for(const auto& v:normalized.signal(id).driver->operands)if(v.kind==OperandKind::Symbol&&g.unit_of[v.node]==u)a=std::max(a,arrivals[v.node]);arrivals[id]=a+g.costs[id];longest=std::max(longest,arrivals[id]);if(g.costs[id]>0||g.stage_deferred[id]){++ops;value_bits+=bits(normalized.signal(id).type);}}
+            if(!g.provider->stageShapeCovered(g.units[u]))throw rtlzz::ArithmeticError({"cost","cost_uncovered","indivisible group is outside validated stage graph domain",g.unit_labels[u],{}});
+            if(g.provider->monotoneGroupBounds()){
+                longest=g.provider->stageDelay(longest,ops,value_bits,g.units[u]);
+                if(longest>available)throw rtlzz::ArithmeticError({"scheduling","schedule_group_over_budget","model indivisible group lower bound="+std::to_string(longest)+" ps exceeds every available stage budget="+std::to_string(available)+" ps",g.unit_labels[u],{}});
+            }
+        }
+        // The unscheduled full graph need not fit one validated stage. Start
+        // with the absolute data cap, then query each actual stage during
+        // placement; never price a fictitious all-graph stage out of domain.
+        upper=std::max(upper,std::max(g.provider->dataBudget(true),g.provider->dataBudget(false)));
     }
     if (!std::isfinite(upper)) throw std::runtime_error("pipeline: delay sum overflow");
     std::vector<int> baseline;
-    if (!g.schedule(upper, baseline)) throw std::runtime_error("pipeline: no feasible schedule for declared groups at N="+std::to_string(g.last));
+    if (!g.schedule(upper, baseline)) {
+        if(g.model_cost&&g.uncovered_stage_attempt)throw rtlzz::ArithmeticError({"cost","cost_uncovered","declared earliest-placement search encountered uncovered stage graph/size and found no fully covered schedule; not predicted infeasibility",{},{}});
+        if(g.model_cost)throw rtlzz::ArithmeticError({"scheduling","schedule_no_placement_found","grouped earliest placement did not find a model-budget-feasible schedule; not a global impossibility proof",{},{}});
+        throw std::runtime_error("pipeline: no feasible schedule for declared groups at N="+std::to_string(g.last));
+    }
     // Monotonic earliest-stage feasibility; keep the feasible upper endpoint.
     for (int i = 0; i < 64 && lower < upper; ++i) {
         double middle = lower + (upper - lower) / 2;
@@ -433,7 +521,13 @@ Program build(const beir::Program& program, const Options& options) {
     result.stages = baseline;
     result.initial_stages=baseline;
     auto before = g.evaluate(baseline);
-    const double allowed = before.final_delay * (1 + options.timing_relaxation_ratio);
+    double allowed = before.final_delay * (1 + options.timing_relaxation_ratio);
+    std::vector<double> allowed_stages;
+    if(g.model_cost){
+        double register_baseline=0;for(std::size_t i=1;i<before.stage_delays.size();++i)register_baseline=std::max(register_baseline,before.stage_delays[i]);
+        for(std::size_t i=0;i<before.stage_delays.size();++i){double t0=i?register_baseline:before.stage_delays[0];allowed_stages.push_back(std::min(t0>0?t0*1.05:std::numeric_limits<double>::infinity(),g.provider->dataBudget(i==0)));}
+        allowed=*std::max_element(allowed_stages.begin(),allowed_stages.end());
+    }
     if (!std::isfinite(allowed)) throw std::runtime_error("pipeline: timing allowance overflow");
     auto current = before;
     std::size_t accepted_group_moves = 0;
@@ -451,12 +545,16 @@ Program build(const beir::Program& program, const Options& options) {
                 if (stage == original) continue;
                 for(auto member:g.units[u]) result.stages[member] = stage;
                 auto candidate = g.evaluate(result.stages);
+                bool within=candidate.final_delay<=allowed;
+                if(g.model_cost){within=within&&candidate.model_feasible;for(std::size_t i=0;i<allowed_stages.size();++i)within=within&&candidate.stage_delays[i]<=allowed_stages[i];}
+                bool improvement=g.model_cost?candidate.predicted_total_area_um2<current.predicted_total_area_um2:candidate.register_bits<current.register_bits;
                 if(options.arithmetic_request) result.moves.push_back({g.unit_labels[u],original,stage,false,
-                    !std::isfinite(candidate.final_delay)?"dependency_or_group_violation":candidate.final_delay>allowed?"schedule_group_over_budget":candidate.register_bits>=current.register_bits?"no_state_improvement":"eligible",
+                    !std::isfinite(candidate.final_delay)?"dependency_or_group_violation":!within?"schedule_group_over_budget":!improvement?"no_state_improvement":"eligible",
                     candidate.final_delay,candidate.register_bits});
-                if (candidate.final_delay <= allowed && candidate.register_bits < current.register_bits &&
+                if (within && improvement &&
+                    (g.model_cost?(candidate.predicted_total_area_um2<best.predicted_total_area_um2 || (candidate.predicted_total_area_um2==best.predicted_total_area_um2&&candidate.final_delay<best.final_delay)):
                     (candidate.register_bits < best.register_bits ||
-                     (candidate.register_bits == best.register_bits && candidate.final_delay < best.final_delay))) {
+                     (candidate.register_bits == best.register_bits && candidate.final_delay < best.final_delay)))) {
                     best = std::move(candidate); best_node = id; best_stage = stage;
                 }
             }
@@ -472,9 +570,10 @@ Program build(const beir::Program& program, const Options& options) {
     result.report = current;
     result.report.baseline_delay = before.final_delay;
     result.report.allowed_delay = allowed;
+    result.report.allowed_stage_delays=allowed_stages;
     result.report.baseline_register_bits = before.register_bits;
     result.report.accepted_group_moves = accepted_group_moves;
-    if(options.arithmetic_request) result.report.cost_model="fixed-op-width-v1";
+    if(options.arithmetic_request&&!g.model_cost) result.report.cost_model="fixed-op-width-v1";
 
     auto& rtl = result.rtl_program;
     std::vector<std::vector<NodeId>> delayed(normalized.signals.size());
@@ -568,6 +667,7 @@ Program build(const beir::Program& program, const Options& options) {
         if (!g.live[original.id]) rtl.signal(original.id).driver.reset();
     connect_valid_output();
     initializeResetValues(result);
+    if(g.model_cost){bool zero=true;for(const auto& reg:result.registers)for(auto v:reg.reset_values)zero&=v==0;for(const auto& [name,words]:result.report.output_reset_values)for(auto v:words)zero&=v==0;g.provider->validateStateProtocol(options.reset_enabled,!options.input_valid_name.empty(),zero);}
     if (options.reset_enabled) {
         if (!names.insert(options.reset_name).second) throw std::runtime_error("pipeline: reset name collides with data port, signal or clock");
         Port reset; reset.name = options.reset_name; reset.direction = PortDirection::Input; reset.type.width = 1;
@@ -637,6 +737,14 @@ void validateProgram(const Program& p) {
         expected.final_delay > p.report.allowed_delay ||
         expected.register_bits != p.report.register_bits || p.registers.size() != expected.register_count)
         throw std::runtime_error("pipeline: invalid schedule or register report");
+    if(g.model_cost){
+        if(!expected.model_feasible||expected.model_state_bits!=p.report.model_state_bits||expected.model_state_signals!=p.report.model_state_signals||expected.predicted_total_area_um2!=p.report.predicted_total_area_um2||expected.predicted_comb_area_um2!=p.report.predicted_comb_area_um2||expected.predicted_state_area_um2!=p.report.predicted_state_area_um2)
+            throw rtlzz::ArithmeticError({"scheduling","schedule_validation_error","model area or absolute timing budget mismatch",{},{}});
+        if(!p.report.allowed_stage_delays.empty()){
+            if(p.report.allowed_stage_delays.size()!=expected.stage_delays.size())throw rtlzz::ArithmeticError({"scheduling","schedule_validation_error","model path-cap shape mismatch",{},{}});
+            for(std::size_t i=0;i<expected.stage_delays.size();++i)if(expected.stage_delays[i]>p.report.allowed_stage_delays[i])throw rtlzz::ArithmeticError({"scheduling","schedule_validation_error","model path exceeds frozen cap",{},{}});
+        }
+    }
     auto stages = p.stages;
     stages.resize(p.rtl_program.signals.size(), -1);
     std::vector<NodeId> origins(stages.size(), kInvalidNodeId);

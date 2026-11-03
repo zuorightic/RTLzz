@@ -90,7 +90,8 @@ void validateArithmeticRequest(const ArithmeticRequest& r,int n) {
         if(arithmeticHash(bytes)!=r.model_bundle_sha256)bad("cost_uncovered","model bundle content identity mismatch");
         auto model=object(bytes);
         if(string(model,"target_platform")!=r.target_platform || string(model,"platform_profile_sha256")!=r.platform_profile_sha256)bad("cost_uncovered","model platform/domain identity mismatch");
-        bad("cost_uncovered","offline model inference is not implemented until step7");
+        if(string(model,"version")!="arithmetic-backend-model-v1" || string(model,"feature_schema")!="arithmetic-physical-features-v2" || string(model,"quality_status")!="passed")
+            bad("cost_uncovered","offline model schema or quality is not ready");
     } else bad("invalid_request","unknown cost mode: "+r.cost_mode);
 }
 }

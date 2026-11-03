@@ -37,6 +37,16 @@ struct PipelineReport {
     double final_delay = 0;
     // Frozen B/C abstract report fields. Zero unless that cost provider is used.
     std::uint64_t combinational_cost = 0;
+    // Backend-model quantities keep physical precision; abstract B/C fields
+    // above retain their integer contract and never contain rounded um2.
+    double predicted_comb_area_um2 = 0;
+    double predicted_state_area_um2 = 0;
+    double predicted_total_area_um2 = 0;
+    std::uint64_t model_state_bits = 0;
+    std::size_t model_state_signals = 0;
+    double input_data_budget_ps = 0, register_data_budget_ps = 0;
+    std::vector<double> allowed_stage_delays;
+    bool model_feasible = false;
     std::size_t accepted_group_moves = 0;
     std::string cost_model = "legacy-operation-weights";
     // Costs indexed from stage 0 through stage register_stages.
