@@ -307,6 +307,29 @@ struct Graph {
         std::vector<std::size_t> stage_operations(last+1,0);std::vector<std::uint64_t> stage_bits(last+1,0);
         std::vector<double> stage_areas(last+1,0);
         std::vector<std::vector<NodeId>> stage_members(last+1);
+        // Context prices belong to this complete proposed placement. Re-query
+        // after every trial move; never reuse a NodeId-only contextual price.
+        auto actual_costs=costs;
+        auto actual_areas=physical_areas;
+        if(model_cost&&provider->requiresStageContext()) {
+            for(auto id:order) {
+                if(stage[id]<0||stage[id]>last||(input[id]&&stage[id]!=0)||(output[id]&&stage[id]!=last)) {
+                    r.final_delay=std::numeric_limits<double>::infinity();return r;
+                }
+                for(const auto& operand:p.signal(id).driver->operands)if(operand.kind==OperandKind::Symbol&&stage[operand.node]>stage[id]) {
+                    r.final_delay=std::numeric_limits<double>::infinity();return r;
+                }
+            }
+            std::vector<NodeId> controls;if(valid_input!=kInvalidNodeId)controls={valid_input,valid_output};
+            for(int at=0;at<=last;++at) {
+                const auto cut=arithmetic::stageCostQuery(p,stage,at,last,controls);
+                for(auto id:cut.members) {
+                    const auto value=provider->nodeInStage(p,id,cut);
+                    if(value.deferred_to_stage||!value.covered)throw rtlzz::ArithmeticError({"cost","cost_uncovered","actual stage query did not return a qualified component",{},std::to_string(id)});
+                    actual_costs[id]=value.delay;actual_areas[id]=value.combinational;
+                }
+            }
+        }
         std::vector<double> arrival(live.size());
         for (auto u : unit_order) for (auto id : units[u]) if (stage[id] != stage[units[u].front()]) {
             r.final_delay = std::numeric_limits<double>::infinity(); return r;
@@ -327,16 +350,16 @@ struct Graph {
                 }
                 if (stage[v.node] == stage[id]) a = std::max(a, arrival[v.node]);
             }
-            arrival[id] = a + costs[id];
+            arrival[id] = a + actual_costs[id];
             r.stage_delays[stage[id]] = std::max(r.stage_delays[stage[id]], arrival[id]);
-            if(costs[id]>0||stage_deferred[id]){++stage_operations[stage[id]];stage_bits[stage[id]]+=bits(s.type);}
+            if(actual_costs[id]>0||stage_deferred[id]){++stage_operations[stage[id]];stage_bits[stage[id]]+=bits(s.type);}
         }
         for (auto id : order) {
             if (constant[id]) continue;
             if (!input[id] && areas[id] > UINT64_MAX - r.combinational_cost)
                 throw std::runtime_error("pipeline: combinational cost overflow");
             if(!input[id]) r.combinational_cost += areas[id];
-            if(!input[id]){r.predicted_comb_area_um2+=physical_areas[id];stage_areas[stage[id]]+=physical_areas[id];}
+            if(!input[id]){r.predicted_comb_area_um2+=actual_areas[id];stage_areas[stage[id]]+=actual_areas[id];}
             int end = stage[id];
             for (auto user : users[id]) end = std::max(end, stage[user]);
             if (id == valid_input) end = last; // Dedicated chain, independent of data consumers.

@@ -35,6 +35,21 @@ struct CostEstimate {
     // as an operation for scheduling, but receives no separate node charge.
     bool deferred_to_stage = false;
 };
+struct StageCapture {
+    NodeId value;
+    unsigned banks;
+};
+// A complete proposed placement, including logical captures at this cut.
+// Constructed from BEIR and the register map, never from a sample identifier.
+struct StageCostQuery {
+    int index = 0, last = 0;
+    std::vector<int> placement;
+    std::vector<NodeId> members, controls;
+    std::vector<StageCapture> captures;
+    std::string graph_sha256, cut_sha256;
+};
+StageCostQuery stageCostQuery(const Program&,const std::vector<int>&,int,int,
+                             const std::vector<NodeId>& controls = {});
 class CostProvider {
 protected:
     CostContext context_;
@@ -45,6 +60,11 @@ public:
     const CostContext& context() const { return context_; }
     virtual ~CostProvider() = default;
     virtual CostEstimate node(const Program&, NodeId) const = 0;
+    virtual CostEstimate nodeInStage(const Program& p,NodeId id,const StageCostQuery&) const { return node(p,id); }
+    virtual bool requiresStageContext() const { return false; }
+    // Separate component coverage from permission to price an entire pipeline.
+    virtual std::string componentReport(const Program&,const std::vector<int>& = {},int = 0,
+                                        const std::vector<NodeId>& = {}) const { return {}; }
     CostEstimate group(const Program&, const std::vector<NodeId>&) const;
     virtual double stateArea(std::uint64_t bits,std::size_t,std::size_t,std::size_t) const { return static_cast<double>(bits); }
     virtual void validateStateProtocol(bool,bool,bool) const {}

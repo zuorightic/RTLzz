@@ -29,6 +29,8 @@ struct ArithmeticDiagnostic {
     std::string failure_stage, failure_code, failure_reason;
     std::string region_id;
     std::string node_id;
+    // Retain ordered candidate attempts when selection has no supported result.
+    std::string selection_report_json;
 };
 class ArithmeticError : public std::runtime_error {
 public:

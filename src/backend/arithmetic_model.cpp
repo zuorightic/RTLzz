@@ -1,4 +1,5 @@
 #include "backend/arithmetic_model.hpp"
+#include "backend/arithmetic_primitives.hpp"
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <algorithm>
@@ -353,7 +354,14 @@ CostEstimate ModelCostProvider::estimateGroup(const Program& p,const std::vector
 double CostProvider::dataBudget(bool) const{return std::numeric_limits<double>::infinity();}
 std::unique_ptr<CostProvider> makeCostProvider(const Program& p,const rtlzz::ArithmeticRequest& r){
     if(r.cost_mode=="fixed")return std::make_unique<FixedCostProvider>(costContext(r));
-    if(r.cost_mode=="backend-model")return std::make_unique<ModelCostProvider>(p,r);
+    if(r.cost_mode=="backend-model"){
+        auto file=llvm::MemoryBuffer::getFile(r.model_bundle);if(!file)fail("model bundle unavailable");
+        auto parsed=llvm::json::parse((*file)->getBuffer());
+        if(!parsed){llvm::consumeError(parsed.takeError());fail("invalid model JSON");}
+        auto bundle=parsed->getAsObject();if(!bundle)fail("model bundle must be an object");
+        if(bundle->getString("version")==kPublishedPrimitiveBundle)return std::make_unique<PublishedPrimitiveCostProvider>(p,r);
+        return std::make_unique<ModelCostProvider>(p,r);
+    }
     fail("unknown cost mode");
 }
 }

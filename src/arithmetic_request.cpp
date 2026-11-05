@@ -1,4 +1,5 @@
 #include "arithmetic_request.hpp"
+#include "backend/arithmetic_primitives.hpp"
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/SHA256.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -37,6 +38,10 @@ int integer(const llvm::json::Object& o,const char* key) {
 std::string arithmeticDiagnosticJson(const ArithmeticDiagnostic& d, const ArithmeticRequest* request) {
     llvm::json::Object o{{"version","arithmetic-structure-report-v2"},{"status","failed"},{"failure_stage",d.failure_stage},{"failure_code",d.failure_code},{"failure_reason",d.failure_reason},{"region_id",d.region_id},{"node_id",d.node_id}};
     if(request)o["request"]=llvm::json::Object{{"target_platform",request->target_platform},{"platform_profile_sha256",request->platform_profile_sha256},{"cost_mode",request->cost_mode},{"model_bundle_sha256",request->model_bundle_sha256},{"candidate_policy",request->candidate_policy},{"semantic_profile",request->semantic_profile},{"L",request->latency},{"II",request->initiation_interval},{"target_period_ps",request->target_period_ps}};
+    if(!d.selection_report_json.empty()) {
+        auto parsed=llvm::json::parse(d.selection_report_json);
+        if(parsed)o["selection"]=std::move(*parsed);else llvm::consumeError(parsed.takeError());
+    }
     return llvm::formatv("{0:2}",llvm::json::Value(std::move(o))).str()+"\n";
 }
 std::string arithmeticHash(const std::string& bytes) {
@@ -90,7 +95,10 @@ void validateArithmeticRequest(const ArithmeticRequest& r,int n) {
         if(arithmeticHash(bytes)!=r.model_bundle_sha256)bad("cost_uncovered","model bundle content identity mismatch");
         auto model=object(bytes);
         if(string(model,"target_platform")!=r.target_platform || string(model,"platform_profile_sha256")!=r.platform_profile_sha256)bad("cost_uncovered","model platform/domain identity mismatch");
-        if(string(model,"version")!="arithmetic-backend-model-v1" || string(model,"feature_schema")!="arithmetic-physical-features-v2" || string(model,"quality_status")!="passed")
+        const auto version=string(model,"version");
+        const bool ordinary=version=="arithmetic-backend-model-v1"&&string(model,"feature_schema")=="arithmetic-physical-features-v2";
+        const bool primitives=version==pred::beir::arithmetic::kPublishedPrimitiveBundle&&string(model,"mux_feature_schema")=="arithmetic-mux-static-features-v1";
+        if((!ordinary&&!primitives)||string(model,"quality_status")!="passed")
             bad("cost_uncovered","offline model schema or quality is not ready");
     } else bad("invalid_request","unknown cost mode: "+r.cost_mode);
 }

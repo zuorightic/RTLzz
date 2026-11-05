@@ -37,7 +37,9 @@ Selection select(const Program& source,const pipeline::Options& options){
         // BEIR text includes precise graph, region and parameter identities.
         auto hash=rtlzz::arithmeticHash(emitText(graph));if(!shapes.insert(hash).second)return;
         ++count;
+        std::string component_coverage;
         try{
+            if(model){auto provider=makeCostProvider(graph,request);component_coverage=provider->componentReport(graph);}
             auto p=pipeline::build(graph,options);pipeline::validateProgram(p);validate(p.rtl_program,"candidate_materialization",false,{options.clock_name,options.reset_name});
             const auto& r=p.report;if(!model&&r.combinational_cost>UINT64_MAX-r.register_bits)throw rtlzz::ArithmeticError({"cost","cost_uncovered","combined fixed score overflow",{},{}});
             Score score{r.final_delay,r.combinational_cost+r.register_bits,r.register_bits,r.register_count,id};
@@ -56,7 +58,9 @@ Selection select(const Program& source,const pipeline::Options& options){
             only_group_bounds&=e.diagnostic.failure_code=="schedule_group_over_budget";
             if(e.diagnostic.failure_code=="cost_uncovered")uncovered_rejection=e.diagnostic;
             else if(e.diagnostic.failure_code!="schedule_group_over_budget")search_rejection=e.diagnostic;
-            attempts.push_back(Object{{"id",id},{"status","rejected"},{"shape_sha256",hash},{"failure_code",e.diagnostic.failure_code},{"failure_stage",e.diagnostic.failure_stage},{"reason",e.diagnostic.failure_reason}});
+            Object rejected{{"id",id},{"status","rejected"},{"shape_sha256",hash},{"failure_code",e.diagnostic.failure_code},{"failure_stage",e.diagnostic.failure_stage},{"reason",e.diagnostic.failure_reason}};
+            if(!component_coverage.empty()){auto parsed=llvm::json::parse(component_coverage);if(parsed)rejected["component_coverage"]=std::move(*parsed);else llvm::consumeError(parsed.takeError());}
+            attempts.push_back(std::move(rejected));
         }
     };
     std::function<void(std::size_t)> enumerate=[&](std::size_t i){
@@ -77,7 +81,14 @@ Selection select(const Program& source,const pipeline::Options& options){
     };
     enumerate(0);
     if(!best) {
-        if(model&&uncovered_rejection)throw rtlzz::ArithmeticError(*uncovered_rejection);
+        if(model&&uncovered_rejection){
+            auto diagnostic=*uncovered_rejection;
+            diagnostic.selection_report_json=llvm::formatv("{0:2}",Value(Object{{"version","arithmetic-selection-v1"},{"policy",request.candidate_policy},
+                {"cost_mode",request.cost_mode},{"K",16},{"model_bundle_sha256",request.model_bundle_sha256},{"candidate_PPA_calls",0},
+                {"evaluated_structures",static_cast<std::uint64_t>(count)},{"candidate_model_coverage_complete",false},{"formal_D_selection",false},
+                {"selection_status","cost_uncovered"},{"candidates",std::move(attempts)}})).str();
+            throw rtlzz::ArithmeticError(std::move(diagnostic));
+        }
         if(model&&search_rejection)throw rtlzz::ArithmeticError(*search_rejection);
         if(model&&count&&only_group_bounds)throw rtlzz::ArithmeticError({"selection","predicted_infeasible","all "+std::to_string(count)+" evaluated candidates violate a model indivisible-group lower bound; scope is ordered K=16 policy, not all possible architectures",{},{}});
         if(last_rejection)throw rtlzz::ArithmeticError(*last_rejection);
