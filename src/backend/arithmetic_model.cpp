@@ -93,7 +93,13 @@ ModelCostProvider::ModelCostProvider(const Program& p,const rtlzz::ArithmeticReq
     for(const auto& s:p.signals)if(s.driver)for(const auto& v:s.driver->operands)if(v.kind==OperandKind::Symbol)++impl_->fanout.at(v.node);
     for(std::size_t i=0;i<p.arithmetic_regions.size();++i)if(p.arithmetic_regions[i].template_version=="softfloat3d-bitvector-mul-v1")for(auto id:p.arithmetic_regions[i].members)impl_->fp_owner.at(id)=static_cast<int>(i);
     if(auto model=impl_->stage().getObject("mul_interval_model")){
-        if(string(*model,"version")!="arithmetic-mul-group-interval-model-v1"||string(*model,"quality_status")!="passed")fail("template interval model is not qualified");
+        const auto schema=string(*model,"version");
+        if((schema!="arithmetic-mul-group-interval-model-v1"&&schema!="arithmetic-mul-group-interval-target-load-v1")||string(*model,"quality_status")!="passed")fail("template interval model is not qualified");
+        if(schema=="arithmetic-mul-group-interval-target-load-v1"){
+            const auto& joint=object(b,"joint_model_context");
+            if(r.target_period_ps<number(joint,"sdc_min_ps")||r.target_period_ps>number(joint,"sdc_max_ps")||number(b,"mapping_abc_target_ps")!=number(joint,"abc_target_ps"))fail("outside joint ordinary/state/boundary target coverage");
+            if(string(*model,"io_policy")!="proportional_0.2T")fail("unsupported target/load IO policy");
+        }
         for(std::size_t i=0;i<p.arithmetic_regions.size();++i){const auto& region=p.arithmetic_regions[i];if(region.template_version!="mul-block-tree-v1")continue;
             arithmetic::validate(p,"model_template_identity");
             const auto& t=region.template_parameters;const int w=t.at("lhs_width"),block=t.at("block_width"),result=t.at("result_width");
@@ -308,9 +314,30 @@ std::optional<double> ModelCostProvider::templateIntervalCost(const std::vector<
     for(auto id:inputs)input_bits+=needed[id].size();
     const auto& t=r.template_parameters;int width=t.at("lhs_width");std::string configuration=t.at("block_width")==width/2?"half":"quarter",shape=t.at("result_width")==2*width?"full":"low";
     const auto& model=object(impl_->stage(),"mul_interval_model");const double abc=number(impl_->bundle(),"mapping_abc_target_ps");
-    if(impl_->request.target_period_ps!=number(model,"sdc_period_ps")||abc!=number(model,"abc_target_ps"))return -1.;
+    const bool target_load=string(model,"version")=="arithmetic-mul-group-interval-target-load-v1";
+    if((!target_load&&impl_->request.target_period_ps!=number(model,"sdc_period_ps"))||abc!=number(model,"abc_target_ps"))return -1.;
     std::string key=configuration+"/"+shape+"/"+std::to_string(first)+"/"+std::to_string(last);auto entry=object(model,"intervals").getObject(key);if(!entry||string(*entry,"quality_status")!="passed")return -1.;
     Features f{{"width",static_cast<double>(width)},{"width_squared",static_cast<double>(width)*width},{"log_width",std::log2(width)},{"capture_bits",static_cast<double>(capture_bits)},{"input_bits",static_cast<double>(input_bits)},{"block_width",static_cast<double>(t.at("block_width"))},{"first",static_cast<double>(first)},{"last",static_cast<double>(last)}};
+    if(target_load){
+        const auto& reference=object(object(object(model,"reference"),"intervals"),key.c_str());
+        const auto& anchors=array(reference,"delay_anchors");if(anchors.size()!=3)fail("invalid target reference anchors");
+        double previous_width=-1,d=-1;
+        for(std::size_t i=0;i<anchors.size();++i){
+            auto point=anchors[i].getAsArray();if(!point||point->size()!=2)fail("invalid target reference point");
+            auto w=(*point)[0].getAsNumber(),delay=(*point)[1].getAsNumber();
+            if(!w||!delay||!std::isfinite(*w)||!std::isfinite(*delay)||*w<=previous_width||*delay<=0)fail("invalid target reference value");
+            previous_width=*w;
+            if(i){auto left=anchors[i-1].getAsArray();double w0=*(*left)[0].getAsNumber(),d0=*(*left)[1].getAsNumber();
+                if(d<0&&w0<=width&&width<=*w)d=d0+(*delay-d0)*(width-w0)/(*w-w0);}
+        }
+        const double h=number(reference,"overhead_ps"),period=impl_->request.target_period_ps;
+        if(d<=0||h<0||period<=h)return -1.;
+        const double pressure=(period-h)/d,tight=std::max(0.0,1.5-pressure);const auto& domain=object(*entry,"domain");
+        if(number(domain,"production_capture_fanout")!=1||pressure<number(domain,"reference_pressure_min")||period>number(domain,"period_max_ps"))return -1.;
+        f.insert({{"capture_fanout",1.},{"width_fanout",static_cast<double>(width)},{"log_width_fanout",std::log2(width)},
+                  {"sdc_period_ps",period},{"reference_delay_ps",d},{"reference_overhead_ps",h},{"pressure",pressure},
+                  {"tightness",tight},{"width_tightness",width*tight},{"load_tightness",tight},{"width_squared_tightness",static_cast<double>(width)*width*tight}});
+    }
     double value=predict(object(*entry,area?"area":"delay"),f);
     if(!area){double scale=number(*entry,"validation_delay_scale");if(scale<1)fail("invalid template validation reserve");value*=scale;}
     return value;
