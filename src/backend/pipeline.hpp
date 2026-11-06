@@ -53,6 +53,11 @@ struct Program {
     std::vector<Move> moves;
 };
 
+struct SchedulingUnit { std::string label; std::vector<beir::NodeId> members; bool fixed=false,constant=false; };
+// Static diagnostic access to the same indivisible units used by build().
+// Requires fixed/abstract costs; it never supplies substitute D prices.
+std::vector<SchedulingUnit> diagnosticSchedulingUnits(const beir::Program&,const Options&);
+
 void initializeResetValues(Program& program);
 void validateOptions(const Options& options);
 Program build(const beir::Program& program, const Options& options);

@@ -50,6 +50,14 @@ struct StageCostQuery {
 };
 StageCostQuery stageCostQuery(const Program&,const std::vector<int>&,int,int,
                              const std::vector<NodeId>& controls = {});
+struct StateCostQuery;
+struct StateCostEstimate {
+    double area_um2 = 0, input_budget_ps = 0, register_budget_ps = 0;
+    std::uint64_t bits = 0, signals = 0;
+    std::string model_sha256, layout_sha256;
+    // A state-bank boundary does not qualify an arithmetic or service boundary.
+    bool joint_arithmetic_boundary_qualified = false;
+};
 class CostProvider {
 protected:
     CostContext context_;
@@ -67,6 +75,8 @@ public:
                                         const std::vector<NodeId>& = {}) const { return {}; }
     CostEstimate group(const Program&, const std::vector<NodeId>&) const;
     virtual double stateArea(std::uint64_t bits,std::size_t,std::size_t,std::size_t) const { return static_cast<double>(bits); }
+    virtual bool requiresStateQuery() const { return false; }
+    virtual StateCostEstimate stateCost(const Program&,const StateCostQuery&) const;
     virtual void validateStateProtocol(bool,bool,bool) const {}
     virtual void validateInterface(const Program&,const std::string&) const {}
     virtual double dataBudget(bool) const;

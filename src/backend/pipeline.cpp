@@ -1,6 +1,7 @@
 #include "backend/pipeline.hpp"
 #include "backend/arithmetic_regions.hpp"
 #include "backend/arithmetic_core.hpp"
+#include "backend/arithmetic_state.hpp"
 #include "backend/rtl_names.hpp"
 
 #include <algorithm>
@@ -86,6 +87,7 @@ std::uint64_t bits(const ValueType& type) {
 
 struct Graph {
     const beir::Program& p;
+    Options state_options;
     int last;
     bool fixed_cost = false;
     bool model_cost = false;
@@ -104,7 +106,7 @@ struct Graph {
     std::vector<std::string> unit_labels;
 
     Graph(const beir::Program& program, const Options& options)
-        : p(program), last(options.register_stages), users(p.signals.size()),
+        : p(program), state_options(options), last(options.register_stages), users(p.signals.size()),
           live(p.signals.size()), input(live.size()), output(live.size()),
           constant(live.size()), costs(live.size()), areas(live.size()),physical_areas(live.size()),stage_deferred(live.size()) {
         fixed_cost=options.arithmetic_request.has_value();
@@ -381,7 +383,13 @@ struct Graph {
                 r.predicted_comb_area_um2+=provider->stageArea(stage_areas[at],stage_operations[at],stage_bits[at],stage_members[at]);
             }
             for(const auto& port:p.ports)if(port.direction==PortDirection::Output)for(auto id:port.element_nodes)add_state(id,1,id==valid_output);
-            r.predicted_state_area_um2=provider->stateArea(r.model_state_bits,r.model_state_signals,max_state_width,min_variable_word);
+            if(provider->requiresStateQuery()) {
+                const auto q=arithmetic::stateCostQuery(p,state_options,stage,state_options.arithmetic_request->target_period_ps,true);
+                const auto state_cost=provider->stateCost(p,q);
+                if(state_cost.bits!=r.model_state_bits||state_cost.signals!=r.model_state_signals)
+                    throw rtlzz::ArithmeticError({"cost","cost_uncovered","typed/scalar state accounting differs",{},{}});
+                r.predicted_state_area_um2=state_cost.area_um2;
+            } else r.predicted_state_area_um2=provider->stateArea(r.model_state_bits,r.model_state_signals,max_state_width,min_variable_word);
             r.predicted_total_area_um2=r.predicted_comb_area_um2+r.predicted_state_area_um2;
         }
         r.final_delay = *std::max_element(r.stage_delays.begin(), r.stage_delays.end());
@@ -389,6 +397,18 @@ struct Graph {
     }
 };
 } // namespace
+
+std::vector<SchedulingUnit> diagnosticSchedulingUnits(const beir::Program& p,const Options& options) {
+    if(options.arithmetic_request&&options.arithmetic_request->cost_mode!="fixed")
+        throw std::runtime_error("diagnostic scheduling units require fixed/abstract context");
+    beir::MutableProgram facts(p);facts.ensureValueFacts();auto normalized=facts.finish();Graph graph(normalized,options);
+    std::vector<SchedulingUnit> result;
+    for(auto u:graph.unit_order) {
+        SchedulingUnit unit;unit.label=graph.unit_labels[u];unit.members=graph.units[u];unit.constant=true;
+        for(auto id:unit.members){unit.fixed|=graph.input[id]||graph.output[id];unit.constant&=graph.constant[id];}
+        result.push_back(std::move(unit));
+    }return result;
+}
 
 bool feasibleSchedule(const beir::Program& p,const Options& o,double cap,std::string& diagnostic) {
     validateOptions(o);
@@ -702,6 +722,12 @@ Program build(const beir::Program& program, const Options& options) {
     if (result.registers.size() != result.report.register_count)
         throw std::runtime_error("pipeline: register accounting mismatch");
     validateProgram(result);
+    if(g.model_cost&&g.provider->requiresStateQuery()) {
+        const auto q=arithmetic::stateCostQuery(result,options.arithmetic_request->target_period_ps,true);
+        const auto price=g.provider->stateCost(result.combinational,q);
+        if(price.area_um2!=result.report.predicted_state_area_um2)
+            throw rtlzz::ArithmeticError({"cost","cost_uncovered","materialized/projected state price differs",{},{}});
+    }
     return result;
 }
 

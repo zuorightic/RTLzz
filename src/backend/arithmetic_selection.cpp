@@ -13,11 +13,7 @@ namespace pred::beir::arithmetic {
 Selection select(const Program& source,const pipeline::Options& options){
     using namespace llvm::json;
     const auto& request=*options.arithmetic_request;
-    std::vector<const ArithmeticRegion*> regions;for(const auto& r:source.arithmetic_regions)if(r.template_version=="mul-original-v1")regions.push_back(&r);
-    if(regions.empty()&&request.candidate_policy=="mul-template-v1")throw rtlzz::ArithmeticError({"eligibility","template_ineligible","no eligible original Mul occurrence",{},{}});
-    // The registered occurrences retain the original optimized Mul NodeId order.
-    std::sort(regions.begin(),regions.end(),[](auto a,auto b){return a->members[0]<b->members[0];});
-    Array attempts;std::set<std::string> shapes;std::size_t count=0,eligible=0;std::string chosen;
+    Array attempts;std::size_t count=0,eligible=0;std::string chosen;
     std::optional<pipeline::Program> best;
     const bool model=request.cost_mode=="backend-model";
     using Score=std::tuple<double,std::uint64_t,std::uint64_t,std::size_t,std::string>;
@@ -27,15 +23,7 @@ Selection select(const Program& source,const pipeline::Options& options){
     std::optional<rtlzz::ArithmeticDiagnostic> last_rejection;
     std::optional<rtlzz::ArithmeticDiagnostic> uncovered_rejection,search_rejection;
     bool only_group_bounds=true;
-    std::vector<mul_split::Configuration> configs;std::vector<std::string> labels;
-    auto evaluate=[&](){
-        if(count>=16)return;std::string id="candidate";for(const auto& x:labels)id+="/"+x;
-        Program graph;
-        try{graph=mul_split::expand(source,configs);}
-        catch(const rtlzz::ArithmeticError& e){last_rejection=e.diagnostic;attempts.push_back(Object{{"id",id},{"status","ineligible"},{"failure_stage",e.diagnostic.failure_stage},{"failure_code",e.diagnostic.failure_code},{"reason",e.diagnostic.failure_reason}});return;}
-        ++eligible;
-        // BEIR text includes precise graph, region and parameter identities.
-        auto hash=rtlzz::arithmeticHash(emitText(graph));if(!shapes.insert(hash).second)return;
+    auto evaluate=[&](const Program& graph,const std::string& id,const std::string& hash){
         ++count;
         std::string component_coverage;
         try{
@@ -63,23 +51,10 @@ Selection select(const Program& source,const pipeline::Options& options){
             attempts.push_back(std::move(rejected));
         }
     };
-    std::function<void(std::size_t)> enumerate=[&](std::size_t i){
-        if(count>=16)return;
-        if(i==regions.size()){evaluate();return;}
-        const auto& r=*regions[i];const int w=std::max(r.template_parameters.at("lhs_width"),r.template_parameters.at("rhs_width"));
-        if(request.candidate_policy=="mul-template-v1"){
-            int b=request.template_parameters.at("block_width");configs.push_back({r.id,b});labels.push_back("block"+std::to_string(b));enumerate(i+1);configs.pop_back();labels.pop_back();return;
-        }
-        for(const auto& descriptor:mul_split::registry()){
-            std::string mode=descriptor.id;
-            if(request.candidate_policy=="core-original-v1" && std::string(mode)!="original")continue;
-            int b=descriptor.block_divisor?std::max(2,w/descriptor.block_divisor):0;
-            if(b && (b>w || r.template_parameters.at("result_width")>r.template_parameters.at("lhs_width")+r.template_parameters.at("rhs_width")))continue;
-            if(std::string(mode)=="quarter" && b==std::max(2,w/2))continue;
-            configs.push_back({r.id,b});labels.push_back(mode);enumerate(i+1);configs.pop_back();labels.pop_back();
-        }
-    };
-    enumerate(0);
+    const auto enumeration=visitCandidateGraphs(source,request,evaluate,[&](const std::string& id,const rtlzz::ArithmeticDiagnostic& d){
+        last_rejection=d;attempts.push_back(Object{{"id",id},{"status","ineligible"},{"failure_stage",d.failure_stage},{"failure_code",d.failure_code},{"reason",d.failure_reason}});
+    });
+    eligible=enumeration.eligible;
     if(!best) {
         if(model&&uncovered_rejection){
             auto diagnostic=*uncovered_rejection;
