@@ -145,6 +145,7 @@ CompileResult compileSource(const CompileOptions& options, OutputKind output_kin
     config.pipeline->reset_name = options.reset_name;
     config.pipeline->reset_active_low = options.reset_active_low;
     config.pipeline->input_reset_values = options.input_reset_values;
+    config.pipeline->service_state_protocol = options.service_state_protocol;
     config.pipeline->operation_delay_weights = options.operation_delay_weights;
     config.pipeline->timing_relaxation_ratio = options.timing_relaxation_ratio;
     config.max_leaf_symbols = options.max_leaf_symbols;

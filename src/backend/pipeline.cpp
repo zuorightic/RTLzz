@@ -2,6 +2,7 @@
 #include "backend/arithmetic_regions.hpp"
 #include "backend/arithmetic_core.hpp"
 #include "backend/arithmetic_state.hpp"
+#include "backend/arithmetic_placement.hpp"
 #include "backend/rtl_names.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <queue>
 #include <set>
 #include <sstream>
+#include <functional>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -91,7 +93,11 @@ struct Graph {
     int last;
     bool fixed_cost = false;
     bool model_cost = false;
+    bool complete_cost = false;
+    mutable bool complete_search_exhausted = false;
+    mutable std::string complete_search_exhaustion_reason;
     mutable bool uncovered_stage_attempt = false;
+    mutable std::string uncovered_complete_reason;
     std::unique_ptr<beir::arithmetic::CostProvider> provider;
     NodeId valid_input = kInvalidNodeId, valid_output = kInvalidNodeId;
     std::vector<NodeId> order;
@@ -112,8 +118,11 @@ struct Graph {
         fixed_cost=options.arithmetic_request.has_value();
         model_cost=options.arithmetic_request&&options.arithmetic_request->cost_mode=="backend-model";
         if(options.arithmetic_request)provider=arithmetic::makeCostProvider(p,*options.arithmetic_request);
+        complete_cost=model_cost&&provider->requiresCompletePlacementCost();
+        if(complete_cost&&!options.service_state_protocol)
+            throw rtlzz::ArithmeticError({"cost","cost_uncovered","complete placement requires explicit service/external protocol",{},{}});
         if(model_cost){provider->validateStateProtocol(options.reset_enabled,!options.input_valid_name.empty(),true);provider->validateInterface(p,options.output_valid_name);}
-        if(model_cost&&(provider->dataBudget(true)<=0||provider->dataBudget(false)<=0))
+        if(model_cost&&!complete_cost&&(provider->dataBudget(true)<=0||provider->dataBudget(false)<=0))
             throw rtlzz::ArithmeticError({"scheduling","nonpositive_data_budget","target does not exceed model boundary/clock overhead in ps",{},{}});
         if (options.arithmetic_request) beir::arithmetic::validate(p,"cost_preflight");
         if (!p.arithmetic_regions.empty()) beir::regions::validate(p);
@@ -218,6 +227,7 @@ struct Graph {
                 if (v.kind != OperandKind::Literal &&
                     (v.kind != OperandKind::Symbol || !constant[v.node])) constant[id] = false;
             if(model_cost&&constant[id])continue;
+            if(complete_cost){stage_deferred[id]=true;continue;}
             auto fixed = provider ? provider->node(p,id) : arithmetic::CostEstimate{};
             if(options.arithmetic_request && !fixed.covered) throw rtlzz::ArithmeticError({"cost","cost_uncovered",fixed.reason,{},std::to_string(id)});
             if (constant[id]) continue;
@@ -230,13 +240,46 @@ struct Graph {
                     : k == Key::Assign ? 0 : k == Key::Multiply ? 3 : 1;
             }
         }
-        if(model_cost&&std::none_of(costs.begin(),costs.end(),[](double value){return value>0;})&&std::none_of(stage_deferred.begin(),stage_deferred.end(),[](bool value){return value;}))
+        if(model_cost&&!complete_cost&&std::none_of(costs.begin(),costs.end(),[](double value){return value>0;})&&std::none_of(stage_deferred.begin(),stage_deferred.end(),[](bool value){return value;}))
             throw rtlzz::ArithmeticError({"cost","cost_uncovered","pure wiring/state-only application has no qualified arithmetic-stage model",{},{}});
     }
 
     // Earliest feasible placement under a cost cap, with output sinks fixed at N.
     bool schedule(double cap, std::vector<int>& stage, std::string* diagnostic=nullptr) const {
         uncovered_stage_attempt=false;
+        uncovered_complete_reason.clear();
+        if(complete_cost){
+            complete_search_exhausted=false;stage.assign(live.size(),0);for(auto id:order)stage[id]=-1;
+            complete_search_exhaustion_reason.clear();
+            std::size_t visited=0;constexpr std::size_t limit=4096;
+            std::function<bool(std::size_t)> place=[&](std::size_t cursor){
+                if(state_options.cost_search_deadline&&std::chrono::steady_clock::now()>=*state_options.cost_search_deadline){
+                    complete_search_exhausted=true;complete_search_exhaustion_reason="shared case cost-search deadline reached";return false;}
+                if(++visited>limit){complete_search_exhausted=true;complete_search_exhaustion_reason="complete-placement-query-limit4096 reached";return false;}
+                if(cursor==unit_order.size()){
+                    try{auto result=evaluate(stage);return result.model_feasible&&std::isfinite(result.final_delay)&&result.final_delay<=cap;}
+                    catch(const rtlzz::ArithmeticError& error){if(error.diagnostic.failure_code!="cost_uncovered")throw;uncovered_stage_attempt=true;
+                        if(uncovered_complete_reason.empty())uncovered_complete_reason=error.diagnostic.failure_reason;return false;}
+                }
+                auto u=unit_order[cursor];int start=0,end=last;bool only_constant=true;
+                for(auto id:units[u]){
+                    only_constant&=constant[id];if(input[id])end=0;if(output[id])start=last;
+                    for(const auto& op:p.signal(id).driver->operands)if(op.kind==OperandKind::Symbol&&unit_of[op.node]!=u&&stage[op.node]>=0)start=std::max(start,stage[op.node]);
+                }
+                if(only_constant&&start==0)end=0;
+                for(int at=start;at<=end&&!complete_search_exhausted;++at){
+                    for(auto id:units[u])stage[id]=at;
+                    auto query=arithmetic::partialPlacementCostQuery(p,state_options,stage,state_options.arithmetic_request->target_period_ps,*state_options.service_state_protocol);
+                    auto lower=arithmetic::evaluatePartialPlacement(p,query,*provider);
+                    bool pruned=lower.certified&&lower.maximum_stage_delay_lower_ps&&*lower.maximum_stage_delay_lower_ps>cap;
+                    if(!pruned&&place(cursor+1))return true;
+                }
+                for(auto id:units[u])stage[id]=-1;return false;
+            };
+            bool found=place(0);if(!found&&diagnostic)*diagnostic=complete_search_exhausted?complete_search_exhaustion_reason+"; no global impossibility claim":
+                "no fully qualified feasible complete placement in declared grouped traversal";
+            return found;
+        }
         stage.assign(live.size(), 0);
         std::vector<double> arrival(live.size());
         std::vector<double> stage_peak(last+1,0);
@@ -292,6 +335,29 @@ struct Graph {
 
     Report evaluate(const std::vector<int>& stage) const {
         Report r; r.stage_delays.assign(static_cast<std::size_t>(last) + 1, 0);
+        if(complete_cost){
+            // Trial moves may reverse dependencies or split an indivisible
+            // group. Reject them before constructing the typed model query.
+            for(auto u:unit_order)for(auto id:units[u])if(stage[id]!=stage[units[u].front()]){
+                r.final_delay=std::numeric_limits<double>::infinity();return r;}
+            for(auto id:order){
+                if(stage[id]<0||stage[id]>last||(input[id]&&stage[id]!=0)||(output[id]&&stage[id]!=last)){
+                    r.final_delay=std::numeric_limits<double>::infinity();return r;}
+                for(const auto& op:p.signal(id).driver->operands)if(op.kind==OperandKind::Symbol&&stage[op.node]>stage[id]){
+                    r.final_delay=std::numeric_limits<double>::infinity();return r;}
+            }
+            auto query=arithmetic::completePlacementCostQuery(p,state_options,stage,state_options.arithmetic_request->target_period_ps,*state_options.service_state_protocol);
+            auto value=arithmetic::evaluateCompletePlacement(p,query,*provider);
+            r.cost_model=provider->modelIdentity();r.stage_delays=value.stage_delays_ps;r.allowed_stage_delays=value.stage_budgets_ps;
+            r.final_delay=value.maximum_stage_delay_ps;r.model_feasible=value.feasible;
+            r.register_bits=value.native_declared_bits;r.register_count=value.native_register_count;
+            r.model_state_bits=value.all_variable_state_bits;r.model_state_signals=value.all_state_signals;
+            r.predicted_comb_area_um2=value.combinational_area_um2;
+            r.predicted_state_area_um2=value.functional_state_area_um2+value.price.shared_physical_area_um2;r.predicted_total_area_um2=value.total_area_um2;
+            r.register_data_budget_ps=*std::min_element(value.stage_budgets_ps.begin(),value.stage_budgets_ps.end());
+            r.input_data_budget_ps=std::numeric_limits<double>::infinity();for(const auto& [name,margin]:value.boundary_margins_ps)if(name.rfind("input_",0)==0)r.input_data_budget_ps=std::min(r.input_data_budget_ps,margin);
+            return r;
+        }
         std::size_t max_state_width=0,min_variable_word=std::numeric_limits<std::size_t>::max();
         auto variable_bits=[&](NodeId id){
             const auto& s=p.signal(id);if(s.type.isArray())throw rtlzz::ArithmeticError({"cost","cost_uncovered","array state has no validated model",{},{}});
@@ -528,7 +594,7 @@ Program build(const beir::Program& program, const Options& options) {
         upper += g.costs[id]; lower = std::max(lower, g.costs[id]);
         if(g.costs[id]>0||g.stage_deferred[id]){++all_operations;all_bits+=bits(normalized.signal(id).type);}
     }
-    if(g.model_cost){
+    if(g.model_cost&&!g.complete_cost){
         lower=0; // A fitted stage scale can reduce the raw node-path proxy.
         if(g.provider->dataBudget(true)<=0||g.provider->dataBudget(false)<=0)
             throw rtlzz::ArithmeticError({"scheduling","nonpositive_data_budget","target does not exceed declared boundary/clock overhead in ps",{},{}});
@@ -546,15 +612,18 @@ Program build(const beir::Program& program, const Options& options) {
         // placement; never price a fictitious all-graph stage out of domain.
         upper=std::max(upper,std::max(g.provider->dataBudget(true),g.provider->dataBudget(false)));
     }
+    if(g.complete_cost){lower=0;upper=options.arithmetic_request->target_period_ps;}
     if (!std::isfinite(upper)) throw std::runtime_error("pipeline: delay sum overflow");
     std::vector<int> baseline;
     if (!g.schedule(upper, baseline)) {
-        if(g.model_cost&&g.uncovered_stage_attempt)throw rtlzz::ArithmeticError({"cost","cost_uncovered","declared earliest-placement search encountered uncovered stage graph/size and found no fully covered schedule; not predicted infeasibility",{},{}});
+        if(g.complete_cost&&g.complete_search_exhausted)throw rtlzz::ArithmeticError({"scheduling","schedule_no_placement_found",g.complete_search_exhaustion_reason+"; no global impossibility claim",{},{}});
+        if(g.model_cost&&g.uncovered_stage_attempt)throw rtlzz::ArithmeticError({"cost","cost_uncovered","declared earliest-placement search encountered uncovered stage graph/size and found no fully covered schedule; not predicted infeasibility"+
+            (g.uncovered_complete_reason.empty()?std::string{}:"; first_model_refusal="+g.uncovered_complete_reason),{},{}});
         if(g.model_cost)throw rtlzz::ArithmeticError({"scheduling","schedule_no_placement_found","grouped earliest placement did not find a model-budget-feasible schedule; not a global impossibility proof",{},{}});
         throw std::runtime_error("pipeline: no feasible schedule for declared groups at N="+std::to_string(g.last));
     }
     // Monotonic earliest-stage feasibility; keep the feasible upper endpoint.
-    for (int i = 0; i < 64 && lower < upper; ++i) {
+    for (int i = 0; i < 64 && lower < upper&&!g.complete_cost; ++i) {
         double middle = lower + (upper - lower) / 2;
         if (middle == lower || middle == upper) break;
         std::vector<int> candidate;
@@ -568,13 +637,17 @@ Program build(const beir::Program& program, const Options& options) {
     std::vector<double> allowed_stages;
     if(g.model_cost){
         double register_baseline=0;for(std::size_t i=1;i<before.stage_delays.size();++i)register_baseline=std::max(register_baseline,before.stage_delays[i]);
-        for(std::size_t i=0;i<before.stage_delays.size();++i){double t0=i?register_baseline:before.stage_delays[0];allowed_stages.push_back(std::min(t0>0?t0*1.05:std::numeric_limits<double>::infinity(),g.provider->dataBudget(i==0)));}
+        for(std::size_t i=0;i<before.stage_delays.size();++i){double t0=i?register_baseline:before.stage_delays[0];
+            double budget=g.complete_cost?before.allowed_stage_delays.at(i):g.provider->dataBudget(i==0);
+            allowed_stages.push_back(std::min(t0>0?t0*1.05:std::numeric_limits<double>::infinity(),budget));}
         allowed=*std::max_element(allowed_stages.begin(),allowed_stages.end());
     }
     if (!std::isfinite(allowed)) throw std::runtime_error("pipeline: timing allowance overflow");
     auto current = before;
     std::size_t accepted_group_moves = 0;
     for (;;) {
+        if(g.complete_cost&&options.cost_search_deadline&&std::chrono::steady_clock::now()>=*options.cost_search_deadline)
+            throw rtlzz::ArithmeticError({"scheduling","schedule_no_placement_found","shared case cost-search deadline reached before full move resolution",{},{}});
         auto best = current;
         NodeId best_node = kInvalidNodeId;
         int best_stage = 0;
@@ -587,7 +660,13 @@ Program build(const beir::Program& program, const Options& options) {
             for (int stage = 0; stage <= g.last; ++stage) {
                 if (stage == original) continue;
                 for(auto member:g.units[u]) result.stages[member] = stage;
-                auto candidate = g.evaluate(result.stages);
+                Report candidate;
+                try{candidate=g.evaluate(result.stages);}
+                catch(const rtlzz::ArithmeticError& error){
+                    if(!g.complete_cost||error.diagnostic.failure_code!="cost_uncovered")throw;
+                    result.moves.push_back({g.unit_labels[u],original,stage,false,"cost_uncovered",0,0});
+                    continue;
+                }
                 bool within=candidate.final_delay<=allowed;
                 if(g.model_cost){within=within&&candidate.model_feasible;for(std::size_t i=0;i<allowed_stages.size();++i)within=within&&candidate.stage_delays[i]<=allowed_stages[i];}
                 bool improvement=g.model_cost?candidate.predicted_total_area_um2<current.predicted_total_area_um2:candidate.register_bits<current.register_bits;
@@ -722,7 +801,11 @@ Program build(const beir::Program& program, const Options& options) {
     if (result.registers.size() != result.report.register_count)
         throw std::runtime_error("pipeline: register accounting mismatch");
     validateProgram(result);
-    if(g.model_cost&&g.provider->requiresStateQuery()) {
+    if(g.complete_cost){
+        auto price=arithmetic::evaluateCompletePlacement(result,options.arithmetic_request->target_period_ps,*options.service_state_protocol,*g.provider);
+        if(!price.feasible||price.total_area_um2!=result.report.predicted_total_area_um2||price.stage_delays_ps!=result.report.stage_delays)
+            throw rtlzz::ArithmeticError({"cost","cost_uncovered","materialized/projected complete placement price differs",{},{}});
+    }else if(g.model_cost&&g.provider->requiresStateQuery()) {
         const auto q=arithmetic::stateCostQuery(result,options.arithmetic_request->target_period_ps,true);
         const auto price=g.provider->stateCost(result.combinational,q);
         if(price.area_um2!=result.report.predicted_state_area_um2)

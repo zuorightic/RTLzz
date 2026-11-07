@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <memory>
+#include <chrono>
+
+namespace pred::beir::arithmetic {struct ServiceStateProtocol;}
 
 namespace pred::pipeline {
 
@@ -23,6 +27,12 @@ struct Options {
     std::string reset_name = "rstn";
     bool reset_active_low = true;
     std::map<std::string, std::vector<std::uint64_t>> input_reset_values;
+    // Required by a qualified complete-placement provider. This is explicit
+    // surrounding service/external semantics, never an assumed zero-cost shell.
+    std::shared_ptr<const beir::arithmetic::ServiceStateProtocol> service_state_protocol;
+    // One monotonic deadline shared by every model candidate in a selection.
+    // It does not alter the graph, model query identity, target or price.
+    std::optional<std::chrono::steady_clock::time_point> cost_search_deadline;
 };
 
 using Report = rtlzz::PipelineReport;

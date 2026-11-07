@@ -1,4 +1,6 @@
 #pragma once
+#include <memory>
+namespace pred::beir::arithmetic {struct ServiceStateProtocol;}
 
 #include "arithmetic_request.hpp"
 
@@ -180,6 +182,8 @@ struct CompileOptions {
     std::string reset_name = "rstn";
     bool reset_active_low = true;
     std::map<std::string, std::vector<std::uint64_t>> input_reset_values;
+    // Caller-owned surrounding RTL protocol. No inferred/default service load.
+    std::shared_ptr<const pred::beir::arithmetic::ServiceStateProtocol> service_state_protocol;
 };
 
 struct CompileResult {

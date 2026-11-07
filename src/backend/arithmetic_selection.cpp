@@ -16,6 +16,9 @@ Selection select(const Program& source,const pipeline::Options& options){
     Array attempts;std::size_t count=0,eligible=0;std::string chosen;
     std::optional<pipeline::Program> best;
     const bool model=request.cost_mode=="backend-model";
+    auto execution_options=options;
+    if(model){auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3600);
+        if(!execution_options.cost_search_deadline||deadline<*execution_options.cost_search_deadline)execution_options.cost_search_deadline=deadline;}
     using Score=std::tuple<double,std::uint64_t,std::uint64_t,std::size_t,std::string>;
     using ModelScore=std::tuple<double,double,std::uint64_t,std::string>;
     std::optional<Score> bestScore;
@@ -28,7 +31,7 @@ Selection select(const Program& source,const pipeline::Options& options){
         std::string component_coverage;
         try{
             if(model){auto provider=makeCostProvider(graph,request);component_coverage=provider->componentReport(graph);}
-            auto p=pipeline::build(graph,options);pipeline::validateProgram(p);validate(p.rtl_program,"candidate_materialization",false,{options.clock_name,options.reset_name});
+            auto p=pipeline::build(graph,execution_options);pipeline::validateProgram(p);validate(p.rtl_program,"candidate_materialization",false,{options.clock_name,options.reset_name});
             const auto& r=p.report;if(!model&&r.combinational_cost>UINT64_MAX-r.register_bits)throw rtlzz::ArithmeticError({"cost","cost_uncovered","combined fixed score overflow",{},{}});
             Score score{r.final_delay,r.combinational_cost+r.register_bits,r.register_bits,r.register_count,id};
             ModelScore modelScore{r.predicted_total_area_um2,r.final_delay,r.register_bits,id};

@@ -51,6 +51,12 @@ struct StageCostQuery {
 StageCostQuery stageCostQuery(const Program&,const std::vector<int>&,int,int,
                              const std::vector<NodeId>& controls = {});
 struct StateCostQuery;
+struct GeneralStateCostQuery;
+struct GeneralStateCostEstimate;
+struct CompletePlacementCostQuery;
+struct CompletePlacementPrice;
+struct PartialPlacementCostQuery;
+struct PartialPlacementBound;
 struct StateCostEstimate {
     double area_um2 = 0, input_budget_ps = 0, register_budget_ps = 0;
     std::uint64_t bits = 0, signals = 0;
@@ -77,6 +83,10 @@ public:
     virtual double stateArea(std::uint64_t bits,std::size_t,std::size_t,std::size_t) const { return static_cast<double>(bits); }
     virtual bool requiresStateQuery() const { return false; }
     virtual StateCostEstimate stateCost(const Program&,const StateCostQuery&) const;
+    virtual GeneralStateCostEstimate generalStateCost(const Program&,const GeneralStateCostQuery&) const;
+    virtual bool requiresCompletePlacementCost() const {return false;}
+    virtual CompletePlacementPrice completePlacementCost(const Program&,const CompletePlacementCostQuery&) const;
+    virtual PartialPlacementBound partialPlacementBound(const Program&,const PartialPlacementCostQuery&) const;
     virtual void validateStateProtocol(bool,bool,bool) const {}
     virtual void validateInterface(const Program&,const std::string&) const {}
     virtual double dataBudget(bool) const;

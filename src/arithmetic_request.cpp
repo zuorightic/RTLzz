@@ -1,6 +1,8 @@
 #include "arithmetic_request.hpp"
 #include "backend/arithmetic_primitives.hpp"
 #include "backend/arithmetic_composite.hpp"
+#include "backend/arithmetic_general_state.hpp"
+#include "backend/arithmetic_joint.hpp"
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/SHA256.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -99,7 +101,7 @@ void validateArithmeticRequest(const ArithmeticRequest& r,int n) {
         const auto version=string(model,"version");
         const bool ordinary=version=="arithmetic-backend-model-v1"&&string(model,"feature_schema")=="arithmetic-physical-features-v2";
         const bool primitives=version==pred::beir::arithmetic::kPublishedPrimitiveBundle&&string(model,"mux_feature_schema")=="arithmetic-mux-static-features-v1";
-        const bool components=version==pred::beir::arithmetic::kComponentManifest;
+        const bool components=version==pred::beir::arithmetic::kComponentManifest||version==pred::beir::arithmetic::kGeneralComponentManifest||version==pred::beir::arithmetic::kJointComponentManifest;
         if((!ordinary&&!primitives&&!components)||string(model,"quality_status")!=(components?"components_passed":"passed"))
             bad("cost_uncovered","offline model schema or quality is not ready");
     } else bad("invalid_request","unknown cost mode: "+r.cost_mode);

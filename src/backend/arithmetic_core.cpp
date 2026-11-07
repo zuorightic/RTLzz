@@ -2,6 +2,7 @@
 #include "backend/arithmetic_regions.hpp"
 #include "backend/mul_contract.hpp"
 #include "backend/pipeline.hpp"
+#include "backend/arithmetic_placement.hpp"
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <algorithm>
@@ -344,31 +345,32 @@ Program normalizeSelections(Program p) {
 }
 std::string report(const Program& p,const rtlzz::ArithmeticRequest& request,const rtlzz::PipelineReport* schedule,const std::vector<int>& stages,const std::string& rtl,const pipeline::Options* settings,bool selected) {
     using namespace llvm::json;
-    auto costs=makeCostProvider(p,request);const bool model=request.cost_mode=="backend-model";Array nodes,regionsJson;
+    auto costs=makeCostProvider(p,request);const bool model=request.cost_mode=="backend-model",complete=model&&costs->requiresCompletePlacementCost();Array nodes,regionsJson;
     for(const auto& s:p.signals) {
         Array operands;for(const auto& v:s.driver->operands) {
             Array dims;for(int dim:v.type.array_dims)dims.push_back(dim);Array limbs;for(auto word:v.constant.limbs)limbs.push_back(std::to_string(word));
             operands.push_back(Object{{"kind",static_cast<int>(v.kind)},{"node",v.kind==OperandKind::Symbol?std::to_string(v.node):""},{"width",v.type.width},{"signed",v.signed_view},{"constant_signed",v.constant.signed_view},{"constant_width",v.constant.width},{"dims",std::move(dims)},{"limbs",std::move(limbs)}});
         }
         Array dims;for(int dim:s.type.array_dims)dims.push_back(dim);
-        auto cost=costs->node(p,s.id);
+        CostEstimate cost;if(complete){cost.covered=false;cost.deferred_to_stage=true;cost.source=costs->modelIdentity();}else cost=costs->node(p,s.id);
         Object physicalFeatures;for(const auto& [key,value]:cost.physical_features)
             physicalFeatures[key]=(key=="log_width"||key=="abc_target_ps"||key=="sdc_period_ps")?Value(value):Value(static_cast<std::int64_t>(value));
         if(!cost.physical_operation.empty()){physicalFeatures["literal_operands"]=false;physicalFeatures["known_one_operands"]=false;
             physicalFeatures["constant_carry"]=false;physicalFeatures["correlated_operands"]=false;}
         nodes.push_back(Object{{"id",std::to_string(s.id)},{"kind",static_cast<int>(s.driver->kind)},{"opcode",static_cast<int>(s.driver->op)},
-            {"width",s.type.width},{"dims",std::move(dims)},{"hi",s.driver->hi},{"lo",s.driver->lo},{"bit",s.driver->bit},{"times",s.driver->times},{"to_width",s.driver->to_width},{"signed_truncation",s.driver->signed_truncation},{"operands",std::move(operands)},{"billing_width",cost.billing_width},{"delay",cost.delay},{"comb",model?Value(cost.combinational):Value(static_cast<std::int64_t>(cost.combinational))},
-            {"covered",cost.covered},{"deferred_to_stage",cost.deferred_to_stage},{"query_status",model?(cost.deferred_to_stage?"deferred_to_validated_template_stage":"predicted_in_domain"):"static_abstract"},{"transaction_constant",s.value.valid&&s.value.constant},{"cost_source",cost.source},{"physical_operation",cost.physical_operation},{"physical_features",std::move(physicalFeatures)}});
+            {"width",s.type.width},{"dims",std::move(dims)},{"hi",s.driver->hi},{"lo",s.driver->lo},{"bit",s.driver->bit},{"times",s.driver->times},{"to_width",s.driver->to_width},{"signed_truncation",s.driver->signed_truncation},{"operands",std::move(operands)},{"billing_width",cost.billing_width},{"delay",complete?Value(nullptr):Value(cost.delay)},{"comb",complete?Value(nullptr):model?Value(cost.combinational):Value(static_cast<std::int64_t>(cost.combinational))},
+            {"covered",cost.covered},{"deferred_to_stage",cost.deferred_to_stage},{"query_status",complete?"deferred_to_complete_placement":model?(cost.deferred_to_stage?"deferred_to_validated_template_stage":"predicted_in_domain"):"static_abstract"},{"transaction_constant",s.value.valid&&s.value.constant},{"cost_source",cost.source},{"physical_operation",cost.physical_operation},{"physical_features",std::move(physicalFeatures)}});
     }
     for(const auto& r:p.arithmetic_regions) {
         Array members,inputs,outputs,groups;for(auto n:r.members)members.push_back(std::to_string(n));for(auto n:r.outputs)outputs.push_back(std::to_string(n));
         for(const auto& v:r.inputs){Array limbs;for(auto word:v.constant.limbs)limbs.push_back(std::to_string(word));inputs.push_back(Object{{"node",v.kind==OperandKind::Symbol?std::to_string(v.node):"literal"},{"width",v.type.width},{"billing_width",billingWidth(p,v)},{"signed_view",v.signed_view},{"constant_signed",v.constant.signed_view},{"constant_width",v.constant.width},{"constant_limbs",std::move(limbs)}});}
         for(const auto& g:r.legal_cut_groups){Array ids;for(auto n:g)ids.push_back(std::to_string(n));groups.push_back(std::move(ids));}
-        auto cost=costs->group(p,r.members);Object parameters;for(const auto& kv:r.template_parameters)parameters[kv.first]=kv.second;
+        CostEstimate cost;if(!complete)cost=costs->group(p,r.members);Object parameters;for(const auto& kv:r.template_parameters)parameters[kv.first]=kv.second;
         regionsJson.push_back(Object{{"id",r.id},{"operation",r.operation},{"semantic_version",r.semantics},{"template_id",r.template_version},{"parameters",std::move(parameters)},
             {"sharing_policy",r.sharing_policy},{"members",std::move(members)},{"inputs",std::move(inputs)},{"outputs",std::move(outputs)},{"legal_groups",std::move(groups)},
-            {"generated",true},{"numerically_validated_by_this_compile",false},{"internally_cuttable",r.internal_split_enabled},{"C_selected",selected&&!model&&request.candidate_policy=="mul-candidates-v1"},{"D_covered",model},{"D_selected",selected&&model&&request.candidate_policy=="mul-candidates-v1"},{"physically_evaluated",false},
-            {"delay",cost.delay},{"comb",model?Value(cost.combinational):Value(static_cast<std::int64_t>(cost.combinational))}});
+            {"generated",true},{"numerically_validated_by_this_compile",false},{"internally_cuttable",r.internal_split_enabled},{"C_selected",selected&&!model&&request.candidate_policy=="mul-candidates-v1"},{"D_covered",model&&!complete},{"D_selected",selected&&model&&request.candidate_policy=="mul-candidates-v1"},{"physically_evaluated",false},
+            {"query_status",complete?"deferred_to_complete_placement":"scalar_group"},
+            {"delay",complete?Value(nullptr):Value(cost.delay)},{"comb",complete?Value(nullptr):model?Value(cost.combinational):Value(static_cast<std::int64_t>(cost.combinational))}});
     }
     Array ports;for(const auto& port:p.ports){Array dims,ids;for(int dim:port.type.array_dims)dims.push_back(dim);for(auto id:port.element_nodes)ids.push_back(std::to_string(id));ports.push_back(Object{{"name",port.name},{"direction",static_cast<int>(port.direction)},{"width",port.type.width},{"dims",std::move(dims)},{"nodes",std::move(ids)}});}
     Object graph{{"nodes",std::move(nodes)},{"regions",std::move(regionsJson)},{"ports",std::move(ports)}};
@@ -404,6 +406,13 @@ std::string report(const Program& p,const rtlzz::ArithmeticRequest& request,cons
         (*physical)["predicted_feasible"]=schedule->model_feasible;
         Array delays,caps;for(auto n:schedule->stage_delays)delays.push_back(n);for(auto n:schedule->allowed_stage_delays)caps.push_back(n);
         (*physical)["stage_delays_ps"]=std::move(delays);(*physical)["allowed_stage_delays_ps"]=std::move(caps);
+    }
+    if(complete&&schedule){
+        if(!settings||!settings->service_state_protocol)bad("report","cost_uncovered","complete report requires surrounding service protocol");
+        auto q=completePlacementCostQuery(p,*settings,stages,request.target_period_ps,*settings->service_state_protocol);
+        auto value=llvm::json::parse(completePlacementEvaluationJson(evaluateCompletePlacement(p,q,*costs)));
+        if(!value){llvm::consumeError(value.takeError());bad("report","cost_uncovered","complete price report JSON invalid");}
+        result["complete_placement_cost"]=std::move(*value);
     }
     return llvm::formatv("{0:2}",Value(std::move(result))).str()+"\n";
 }
