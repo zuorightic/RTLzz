@@ -8,6 +8,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -46,6 +47,12 @@ static NodeId canonical(const Program& p,NodeId id){std::set<NodeId> seen;
         id=d.operands[0].node;
     }throw std::runtime_error("cyclic channel alias");
 }
+static std::string wiring_kind(const Operation& d){switch(d.kind){
+    case OperationKind::Assign:return "assign";case OperationKind::Cast:return "cast";
+    case OperationKind::ZExt:return "zext";case OperationKind::Trunc:return "trunc";
+    case OperationKind::Slice:return "slice";case OperationKind::Concat:return "concat";
+    case OperationKind::BitSelect:return "bit_select";default:return "none";
+}}
 struct Semantics {
     const Program& p;std::map<NodeId,const ArithmeticRegion*> fp;std::set<NodeId> fp_internal;
     std::map<NodeId,std::set<NodeId>> leaves;
@@ -69,13 +76,21 @@ struct Semantics {
             else row["kind"]="port";operands.push_back(std::move(row));}
         rows.push_back(O{{"id",s.id},{"width",s.type.width},{"operation",fp.count(s.id)?"fp32":operation(*s.driver)},
             {"constant",s.value.valid&&s.value.constant},{"driver_kind",int(s.driver->kind)},{"opcode",int(s.driver->op)},
+            {"hi",s.driver->hi},{"lo",s.driver->lo},{"to_width",s.driver->to_width},
+            {"bit",s.driver->bit},{"wiring_kind",wiring_kind(*s.driver)},
             {"operands",std::move(operands)},{"known_zero_hex",words(s.value.known_zero)},{"known_one_hex",words(s.value.known_one)}});
     }return rows;}
 };
 
 int main(int argc,char** argv){try{
-    check(argc==4,"root, nine source manifest, output required");const std::filesystem::path root=argv[1],manifest=argv[2],out=argv[3];std::filesystem::create_directories(out);
-    auto parsed=llvm::json::parse(read(manifest));check(bool(parsed),"source manifest JSON");const auto& entries=*parsed->getAsObject()->getArray("cases");
+    check(argc==4,"root, source manifest, output required");const std::filesystem::path root=argv[1],manifest=argv[2],out=argv[3];
+    check(!std::filesystem::exists(out),"preserve previous native export");
+    auto parsed=llvm::json::parse(read(manifest));check(bool(parsed)&&parsed->getAsObject(),"source manifest JSON");
+    const auto& manifest_object=*parsed->getAsObject();const auto* listed=manifest_object.getArray("cases");
+    check(listed&&!listed->empty(),"nonempty source list required");const auto& entries=*listed;
+    auto assignment_limit=manifest_object.getInteger("exhaustive_assignment_limit").value_or(0);
+    check(assignment_limit>=0&&assignment_limit<=1000000,"bounded assignment limit required");
+    std::filesystem::create_directories(out);
     const auto model_path=root/"experiments/arithmetic_dse/configs/model_asap7_d_components_v1.json";
     const auto primitive_path=root/"experiments/arithmetic/evidence/step7_m2_mux_static_v1/asap7-primitives.json";
     rtlzz::ArithmeticRequest fixed;fixed.target_platform="asap7";fixed.platform_profile=(root/"experiments/arithmetic_dse/configs/platforms/asap7.json").string();fixed.platform_profile_sha256=rtlzz::arithmeticHash(read(fixed.platform_profile));
@@ -117,6 +132,24 @@ int main(int argc,char** argv){try{
             for(const auto& base:std::vector<std::pair<std::string,std::vector<int>>>{{"initial",actual.initial_stages},{"final",actual.stages}})
                 for(const auto& unit:units)if(!unit.fixed&&!unit.constant)for(int at=0;at<=settings.register_stages;++at)if(at!=base.second[unit.members.front()]){
                     auto trial=base.second;for(auto member:unit.members)trial[member]=at;add_view(trial,base.first+"_legal_neighbour/"+unit.label+"/"+std::to_string(at));}
+            std::uint64_t assignment_trials=0;
+            if(assignment_limit) {
+                std::vector<const pipeline::SchedulingUnit*> movable;
+                std::uint64_t combinations=1;
+                for(const auto& unit:units)if(!unit.fixed&&!unit.constant) {
+                    check(combinations<=std::uint64_t(assignment_limit)/(settings.register_stages+1),"complete placement enumeration exceeds declared limit");
+                    combinations*=settings.register_stages+1;movable.push_back(&unit);
+                }
+                auto trial=actual.initial_stages;
+                std::function<void(std::size_t)> enumerate_placements=[&](std::size_t at) {
+                    if(at==movable.size()){++assignment_trials;add_view(trial,"exhaustive_unit_assignment");return;}
+                    for(int stage=0;stage<=settings.register_stages;++stage) {
+                        for(auto member:movable[at]->members)trial[member]=stage;
+                        enumerate_placements(at+1);
+                    }
+                };
+                enumerate_placements(0);check(assignment_trials==combinations,"incomplete declared placement enumeration");
+            }
             A regions;for(const auto& r:p.arithmetic_regions){O parameters;for(const auto& x:r.template_parameters)parameters[x.first]=x.second;A cut_groups;for(const auto& group:r.legal_cut_groups)cut_groups.push_back(ids(group));
                 regions.push_back(O{{"id",r.id},{"template",r.template_version},{"operation",r.operation},{"internal_split",r.internal_split_enabled},
                     {"parameters",std::move(parameters)},{"members",ids(r.members)},{"outputs",ids(r.outputs)},{"legal_cut_groups",std::move(cut_groups)}});}
@@ -140,6 +173,7 @@ int main(int argc,char** argv){try{
                 {"diagnostic_period_ps",1500},{"formal_target_qualified",false},{"ports",std::move(ports)},{"nodes",semantic.nodes()},
                 {"regions",std::move(regions)},{"units",std::move(group_rows)},{"state_source_info",std::move(source_info)},
                 {"views",std::move(placements)},{"illegal_move_proposals",illegal},{"primitive_C_final_coverage",std::move(*coverage)},
+                {"exhaustive_unit_assignments_checked",assignment_limit!=0},{"unit_assignment_trials",assignment_trials},
                 {"actual_C_final_state_materialization_checked",true},{"D_selection_completed",false},{"PPA_calls",0}});
             candidates.push_back(O{{"id",id},{"shape_sha256",shape},{"file",filename},{"sha256",rtlzz::arithmeticHash(read(out/filename))},{"views",static_cast<std::uint64_t>(views.size())}});
             ++total_candidates;total_views+=views.size();total_illegal+=illegal;
@@ -149,7 +183,8 @@ int main(int argc,char** argv){try{
             {"eligible",enumeration.eligible},{"unique",enumeration.unique},{"candidates",std::move(candidates)}});
         std::cout<<name<<": "<<enumeration.unique<<" production candidates audited\n";
     }
-    check(cases.size()==9&&total_candidates==21,"nine-case production policy must have 21 candidates");
+    check(cases.size()==entries.size()&&total_candidates>0,"source list not completely exported");
+    if(auto expected=manifest_object.getInteger("expected_candidate_count"))check(total_candidates==std::size_t(*expected),"declared candidate count mismatch");
     // Four independent occurrences have 81 configurations: exercise the real
     // policy cutoff separately from the nine-case maximum of nine candidates.
     pipelinev2::PipelineConfig cap;cap.source_name="D-policy-K16.cpp";std::string text="#include <fixint.hpp>\nbool iv,ov;\n#pragma input_port iv\n#pragma output_port ov\n";
@@ -161,6 +196,7 @@ int main(int argc,char** argv){try{
     write(out/"K16.json",O{{"candidate_order",std::move(cap_order)},{"K",16},{"unique",capped.unique},{"PPA_calls",0}});
     write(out/"index.json",O{{"version","D-static-requirements-index-v1"},{"cases",std::move(cases)},{"candidate_count",total_candidates},
         {"view_count",total_views},{"illegal_move_proposals",total_illegal},{"PPA_calls",0},{"full_D_ready",false},
-        {"placement_scope","actual C initial/final and recorded trajectory plus every one-unit structural neighbour of initial/final; future D trajectories are not exhaustively enumerated"}});
-    std::cout<<"PASS 21 shared-production candidates, legal placement views and unmodified model refusals\n";
+        {"exhaustive_unit_assignments_checked",assignment_limit!=0},
+        {"placement_scope",assignment_limit?"complete bounded assignment of all nonconstant movable production scheduling units; fixed units retained; every map checked by production evaluateSchedule":"actual C initial/final and recorded trajectory plus every one-unit structural neighbour of initial/final; future D trajectories are not exhaustively enumerated"}});
+    std::cout<<"PASS "<<total_candidates<<" shared-production candidates, "<<total_views<<" legal placement views and unmodified model refusals\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
