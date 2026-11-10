@@ -622,6 +622,8 @@ PipelineResult compile(const PipelineConfig& config) {
                 ? pipeline::emitText(*result.pipeline_program) : beir::emitText(beir_program);
             break;
         case OutputKind::Rtl:
+            if(config.arithmetic_request && !config.arithmetic_request->operator_boundary_policy.empty() && config.use_circt)
+                throw rtlzz::ArithmeticError({"rtl_emission","unsupported_backend_op","operator hierarchy policy requires the native emitter; CIRCT does not implement this boundary contract",{}, {}});
             if (config.use_circt) {
                 if (config.progress_callback) config.progress_callback("RTLzz CIRCT lowering and optimization");
                 const bool retain = config.rtl_debug_output != RtlDebugOutputKind::None;
@@ -638,7 +640,17 @@ PipelineResult compile(const PipelineConfig& config) {
                 }
                 result.output_text = std::move(circt_result.verilog);
             } else {
-                if (result.pipeline_program) {
+                const bool arithmetic_boundary=config.arithmetic_request&&!config.arithmetic_request->operator_boundary_policy.empty();
+                if(arithmetic_boundary) {
+                    if(config.rtl_module_body) {
+                        auto emitted=result.pipeline_program
+                            ? rtlgen::emitSystemVerilogBodyWithArithmeticBoundaries(*result.pipeline_program,config.rtl_port_bindings)
+                            : rtlgen::emitSystemVerilogBodyWithArithmeticBoundaries(beir_program,config.rtl_port_bindings);
+                        result.output_text=std::move(emitted.body);result.rtl_module_definitions=std::move(emitted.module_definitions);
+                    } else result.output_text=result.pipeline_program
+                        ? rtlgen::emitSystemVerilogWithArithmeticBoundaries(*result.pipeline_program)
+                        : rtlgen::emitSystemVerilogWithArithmeticBoundaries(beir_program);
+                } else if (result.pipeline_program) {
                     result.output_text = config.rtl_module_body
                         ? rtlgen::emitSystemVerilogBody(*result.pipeline_program, config.rtl_port_bindings)
                         : rtlgen::emitSystemVerilog(*result.pipeline_program);
@@ -664,12 +676,19 @@ PipelineResult compile(const PipelineConfig& config) {
         if(config.arithmetic_request) result.arithmetic_report=beir::arithmetic::report(
             result.pipeline_program?result.pipeline_program->combinational:beir_program,*config.arithmetic_request,
             result.pipeline_report?&*result.pipeline_report:nullptr,
-            result.pipeline_program?result.pipeline_program->stages:std::vector<int>{},result.output_text,
+            result.pipeline_program?result.pipeline_program->stages:std::vector<int>{},result.output_text+result.rtl_module_definitions,
             result.pipeline_program?&result.pipeline_program->options:nullptr);
         if(config.arithmetic_request && !arithmetic_selection.empty()) {
             auto parsed=llvm::json::parse(result.arithmetic_report);auto selection=llvm::json::parse(arithmetic_selection);
             (*parsed->getAsObject())["selection"]=std::move(*selection);
             result.arithmetic_report=llvm::formatv("{0:2}",*parsed).str()+"\n";
+        }
+        if(config.arithmetic_request && !config.arithmetic_request->operator_boundary_policy.empty()) {
+            auto report=llvm::json::parse(result.arithmetic_report);auto& obj=*report->getAsObject();
+            obj["operator_boundary_policy"]=config.arithmetic_request->operator_boundary_policy;
+            obj["rtl_body_sha256"]=rtlzz::arithmeticHash(result.output_text);
+            obj["rtl_module_definitions_sha256"]=rtlzz::arithmeticHash(result.rtl_module_definitions);
+            result.arithmetic_report=llvm::formatv("{0:2}",*report).str()+"\n";
         }
         result.beir_program = std::move(beir_program);
         return result;

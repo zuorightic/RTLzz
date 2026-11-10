@@ -163,8 +163,11 @@ static void emitLocList(std::ostream& os, const std::vector<DebugLoc>& locs) {
 
 class Emitter {
 public:
-    explicit Emitter(const beir::Program& program, const pipeline::Program* pipeline = nullptr)
-        : program_(program), pipeline_(pipeline && pipeline->options.register_stages > 0 ? pipeline : nullptr) {
+    explicit Emitter(const beir::Program& program, const pipeline::Program* pipeline = nullptr, bool arithmetic_boundaries = false)
+        : program_(program), pipeline_(pipeline && pipeline->options.register_stages > 0 ? pipeline : nullptr), arithmetic_boundaries_(arithmetic_boundaries) {
+        if(arithmetic_boundaries_)for(const auto& region:program_.arithmetic_regions)
+            if(region.template_version=="softfloat3d-bitvector-mul-v1")
+                throw std::runtime_error("unsigned arithmetic boundary emitter does not qualify atomic binary32 internals");
         if (pipeline_) {
             const auto& clock = pipeline_->options.clock_name;
             if (rtl_names::isSystemVerilogKeyword(clock) || sanitizeIdentifier(clock) != clock)
@@ -193,6 +196,7 @@ public:
         emitSignalAssignments(os);
         emitRegisters(os);
         os << "endmodule\n";
+        if(arithmetic_boundaries_)emitArithmeticModules(os);
         return os.str();
     }
 
@@ -231,6 +235,10 @@ public:
         emitSignalAssignments(os);
         emitRegisters(os);
         return os.str();
+    }
+
+    std::string arithmeticModuleDefinitions() const {
+        std::ostringstream os;if(arithmetic_boundaries_)emitArithmeticModules(os);return os.str();
     }
 
     std::string emitDebugReport() {
@@ -285,6 +293,7 @@ public:
 private:
     const beir::Program& program_;
     const pipeline::Program* pipeline_ = nullptr;
+    bool arithmetic_boundaries_ = false;
     std::unordered_set<NodeId> register_nodes_;
     std::unordered_map<std::string, NodeId> name_to_node_;
 
@@ -767,6 +776,33 @@ private:
         os << "    end\n";
     }
 
+    bool arithmeticBoundary(const beir::Signal& signal) const {
+        if(!arithmetic_boundaries_||!signal.driver||register_nodes_.count(signal.id))return false;
+        const auto& d=*signal.driver;
+        bool selected=d.kind==beir::OperationKind::AddCarry ||
+            (d.kind==beir::OperationKind::Binary&&(d.op==beir::OpCode::Mul||d.op==beir::OpCode::Add));
+        if(!selected)return false;
+        if(signal.type.isArray())throw std::runtime_error("arithmetic boundary requires scalar results");
+        for(const auto& operand:d.operands)if(operand.type.isArray()||operand.signed_view||operand.constant.signed_view)
+            throw std::runtime_error("arithmetic boundary currently requires unsigned scalar operands");
+        return true;
+    }
+
+    std::string arithmeticModuleName(NodeId id) const {
+        return sanitizeIdentifier(program_.function_name)+"__rtlzz_arith_"+std::to_string(id);
+    }
+
+    void emitArithmeticModules(std::ostream& os) const {
+        for(const auto& signal:program_.signals)if(arithmeticBoundary(signal)){
+            auto d=*signal.driver;
+            os<<"\n(* keep_hierarchy=1 *) module "<<arithmeticModuleName(signal.id)<<"(";
+            for(std::size_t i=0;i<d.operands.size();++i){if(i)os<<", ";os<<"input wire ["<<widthOf(d.operands[i].type)-1<<":0] a"<<i;
+                d.operands[i].kind=beir::OperandKind::Port;d.operands[i].text="a"+std::to_string(i);}
+            os<<", output wire ["<<widthOf(signal.type)-1<<":0] y);\n    assign y = "
+              <<resizeExpr(expr(d),widthOf(d.type),widthOf(signal.type),false)<<";\nendmodule\n";
+        }
+    }
+
     void emitSignalAssignments(std::ostream& os) const {
         for (const auto& signal : program_.signals) {
             if (omitted_arrays_.count(signal.id) || register_nodes_.count(signal.id)) continue;
@@ -776,6 +812,12 @@ private:
                 continue;
             }
             if (signal.driver) {
+                if(arithmeticBoundary(signal)){
+                    os<<"    (* keep_hierarchy=1 *) "<<arithmeticModuleName(signal.id)<<" rtlzz_arith_"<<signal.id<<"(";
+                    for(std::size_t i=0;i<signal.driver->operands.size();++i){if(i)os<<", ";os<<".a"<<i<<"("<<operand(signal.driver->operands[i])<<")";}
+                    os<<", .y("<<sig(signal.id)<<"));"<<debugComment(signal.driver->debug)<<"\n";
+                    continue;
+                }
                 if (signal.driver->kind == beir::OperationKind::PortRead &&
                     isDirectPortSignal(signal)) {
                     continue;
@@ -1260,6 +1302,26 @@ private:
 
 std::string emitSystemVerilog(const pipeline::Program& program) {
     return Emitter(program.rtl_program, &program).emit();
+}
+
+std::string emitSystemVerilogWithArithmeticBoundaries(const pipeline::Program& program) {
+    return Emitter(program.rtl_program,&program,true).emit();
+}
+
+std::string emitSystemVerilogWithArithmeticBoundaries(const beir::Program& program) {
+    return Emitter(program,nullptr,true).emit();
+}
+
+ArithmeticBoundaryBody emitSystemVerilogBodyWithArithmeticBoundaries(const pipeline::Program& program,
+    const std::vector<std::pair<std::string,std::string>>& bindings) {
+    Emitter emitter(program.rtl_program,&program,true);
+    auto body=emitter.emitBody(bindings);return {std::move(body),emitter.arithmeticModuleDefinitions()};
+}
+
+ArithmeticBoundaryBody emitSystemVerilogBodyWithArithmeticBoundaries(const beir::Program& program,
+    const std::vector<std::pair<std::string,std::string>>& bindings) {
+    Emitter emitter(program,nullptr,true);
+    auto body=emitter.emitBody(bindings);return {std::move(body),emitter.arithmeticModuleDefinitions()};
 }
 
 std::string emitSystemVerilogBody(

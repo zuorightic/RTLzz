@@ -51,10 +51,12 @@ std::string arithmeticHash(const std::string& bytes) {
 }
 ArithmeticRequest loadArithmeticRequest(const std::string& filename) {
     auto o=object(read(filename));
-    keys(o,{"version","target_platform","platform_profile","platform_profile_sha256","cost_mode","fixed_cost_table","fixed_cost_table_sha256","model_bundle","model_bundle_sha256","candidate_policy","semantic_profile","L","II","target_period_ps","template_parameters"});
+    keys(o,{"version","target_platform","platform_profile","platform_profile_sha256","cost_mode","fixed_cost_table","fixed_cost_table_sha256","model_bundle","model_bundle_sha256","candidate_policy","semantic_profile","operator_boundary_policy","L","II","target_period_ps","template_parameters"});
     ArithmeticRequest r;r.version=string(o,"version");r.target_platform=string(o,"target_platform");
     r.platform_profile=string(o,"platform_profile");r.platform_profile_sha256=string(o,"platform_profile_sha256");
     r.cost_mode=string(o,"cost_mode");r.candidate_policy=string(o,"candidate_policy");r.semantic_profile=string(o,"semantic_profile");
+    r.operator_boundary_policy=string(o,"operator_boundary_policy",false);
+    if(r.version=="arithmetic-request-v1"&&o.get("operator_boundary_policy"))bad("invalid_request","operator_boundary_policy requires arithmetic-request-v2");
     r.fixed_cost_table=string(o,"fixed_cost_table",false);r.fixed_cost_table_sha256=string(o,"fixed_cost_table_sha256",false);
     r.model_bundle=string(o,"model_bundle",false);r.model_bundle_sha256=string(o,"model_bundle_sha256",false);
     r.latency=integer(o,"L");r.initiation_interval=integer(o,"II");auto period=o.getNumber("target_period_ps");
@@ -69,7 +71,10 @@ ArithmeticRequest loadArithmeticRequest(const std::string& filename) {
     return r;
 }
 void validateArithmeticRequest(const ArithmeticRequest& r,int n) {
-    if(r.version!="arithmetic-request-v1")bad("invalid_request","unsupported request version");
+    if(r.version!="arithmetic-request-v1"&&r.version!="arithmetic-request-v2")bad("invalid_request","unsupported request version");
+    if((r.version=="arithmetic-request-v1"&&!r.operator_boundary_policy.empty()) ||
+       (r.version=="arithmetic-request-v2"&&r.operator_boundary_policy!="unsigned-op-hierarchy-v1"))
+        bad("invalid_request","unsupported or missing versioned operator boundary policy");
     if(r.target_platform!="asap7" && r.target_platform!="nangate45" && r.target_platform!="sky130hd" && r.target_platform!="gf180")bad("invalid_request","unsupported target platform");
     if(r.latency<1 || r.latency==std::numeric_limits<int>::max() || n!=r.latency-1)bad("invalid_request","request L must equal register_stages+1");
     if(r.initiation_interval!=1)bad("invalid_request","only II=1 is implemented");
@@ -95,6 +100,8 @@ void validateArithmeticRequest(const ArithmeticRequest& r,int n) {
         auto bytes=read(r.model_bundle);
         if(arithmeticHash(bytes)!=r.model_bundle_sha256)bad("cost_uncovered","model bundle content identity mismatch");
         auto model=object(bytes);
+        if(!r.operator_boundary_policy.empty()&&model.getString("operator_boundary_policy").value_or("")!=r.operator_boundary_policy)
+            bad("cost_uncovered","model does not qualify the requested operator boundary strategy");
         if(string(model,"target_platform")!=r.target_platform || string(model,"platform_profile_sha256")!=r.platform_profile_sha256)bad("cost_uncovered","model platform/domain identity mismatch");
         const auto version=string(model,"version");
         const bool ordinary=version=="arithmetic-backend-model-v1"&&string(model,"feature_schema")=="arithmetic-physical-features-v2";

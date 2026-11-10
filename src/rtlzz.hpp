@@ -202,6 +202,7 @@ struct CompileResult {
     std::string arithmetic_report;
     // Available for pipeline, valid-channel or reset-evaluation compilation regardless of debug mode.
     std::optional<PipelineReport> pipeline_report;
+    std::string rtl_module_definitions;
 
     bool ok() const;
 };

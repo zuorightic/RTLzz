@@ -32,6 +32,16 @@ struct RtlDebugSignal {
 
 std::string emitSystemVerilog(const beir::Program& program);
 std::string emitSystemVerilog(const pipeline::Program& program);
+// Explicit unsigned Mul/Add/AddCarry module boundaries. The same entry is
+// available for combinational A and materialized B/C/D. Flow compatibility and
+// mapped boundary/area qualification remain separate experiment requirements.
+std::string emitSystemVerilogWithArithmeticBoundaries(const pipeline::Program&);
+std::string emitSystemVerilogWithArithmeticBoundaries(const beir::Program&);
+struct ArithmeticBoundaryBody { std::string body, module_definitions; };
+ArithmeticBoundaryBody emitSystemVerilogBodyWithArithmeticBoundaries(
+    const pipeline::Program&,const std::vector<std::pair<std::string,std::string>>&);
+ArithmeticBoundaryBody emitSystemVerilogBodyWithArithmeticBoundaries(
+    const beir::Program&,const std::vector<std::pair<std::string,std::string>>&);
 std::string emitSystemVerilogBody(
     const pipeline::Program& program,
     const std::vector<std::pair<std::string, std::string>>& port_bindings);

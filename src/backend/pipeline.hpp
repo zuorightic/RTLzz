@@ -61,6 +61,11 @@ std::vector<SchedulingUnit> diagnosticSchedulingUnits(const beir::Program&,const
 void initializeResetValues(Program& program);
 void validateOptions(const Options& options);
 Program build(const beir::Program& program, const Options& options);
+// Materialize an explicitly chosen structurally legal placement through the
+// same register/valid/reset implementation as build(). This does not schedule,
+// grant physical prices or certify timing. Fixed costs are used only for the
+// structural report; a caller's model evaluation must remain separately bound.
+Program materializeSchedule(const beir::Program&,const Options&,const std::vector<int>&);
 // Same constraints/costs as initial, move and final scheduling. Invalid maps
 // report infinite delay; callers must not materialize them.
 Report evaluateSchedule(const beir::Program&,const Options&,const std::vector<int>&);

@@ -192,6 +192,7 @@ CompileResult compileSource(const CompileOptions& options, OutputKind output_kin
     }
     CompileResult out;
     out.output_codelines = splitCodeLines(result.output_text);
+    out.rtl_module_definitions = std::move(result.rtl_module_definitions);
     out.pipeline_report = result.pipeline_report;
     out.arithmetic_diagnostic = result.arithmetic_diagnostic;
     out.arithmetic_report = result.arithmetic_report;

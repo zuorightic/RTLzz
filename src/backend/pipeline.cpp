@@ -472,8 +472,12 @@ void validateOptions(const Options& o) {
     }
 }
 
-Program build(const beir::Program& program, const Options& options) {
+static Program buildImpl(const beir::Program& program, const Options& options,
+                         const std::vector<int>* selected_stages) {
     validateOptions(options);
+    if(selected_stages && (!options.arithmetic_request || options.arithmetic_request->cost_mode!="fixed" ||
+                          selected_stages->size()!=program.signals.size()))
+        throw rtlzz::ArithmeticError({"materialization","schedule_validation_error","explicit placement requires matching map and a fixed structural context, not physical qualification",{}, {}});
     beir::Program normalized = program;
     if (options.arithmetic_request) {
         beir::MutableProgram facts(normalized);
@@ -484,7 +488,7 @@ Program build(const beir::Program& program, const Options& options) {
     result.options = options;
     result.combinational = normalized;
     result.rtl_program = normalized;
-    if (!options.register_stages && !options.reset_enabled && options.input_valid_name.empty()) {
+    if (!options.register_stages && !options.reset_enabled && options.input_valid_name.empty() && !selected_stages) {
         if(!normalized.arithmetic_regions.empty()) beir::regions::validate(normalized);
         if(options.arithmetic_request) {
             Graph graph(normalized,options);
@@ -508,10 +512,18 @@ Program build(const beir::Program& program, const Options& options) {
         driver.operands.push_back(value); output.driver = std::move(driver);
         addDebugMessage(output.debug, "backend-owned pipeline valid output");
     };
+    if(selected_stages) {
+        auto report=g.evaluate(*selected_stages);
+        if(!std::isfinite(report.final_delay))
+            throw rtlzz::ArithmeticError({"materialization","schedule_validation_error","explicit placement violates dependency, group or interface constraints",{}, {}});
+        result.stages=*selected_stages;result.initial_stages=*selected_stages;
+        result.report=report;result.report.baseline_delay=report.final_delay;
+        result.report.allowed_delay=report.final_delay;result.report.baseline_register_bits=report.register_bits;
+    }
     if (!options.register_stages) {
         if (options.reset_enabled || !result.valid_nodes.empty()) {
             const auto& graph = g;
-            result.stages.assign(program.signals.size(), 0);
+            if(!selected_stages)result.stages.assign(program.signals.size(), 0);
             result.report = graph.evaluate(result.stages);
             result.report.baseline_delay = result.report.final_delay;
             result.report.allowed_delay = result.report.final_delay * (1 + options.timing_relaxation_ratio);
@@ -522,6 +534,7 @@ Program build(const beir::Program& program, const Options& options) {
         result.initial_stages=result.stages;
         return result;
     }
+    if(!selected_stages) {
     double upper = 0, lower = 0;
     std::size_t all_operations=0;std::uint64_t all_bits=0;
     for (auto id : g.order) {
@@ -617,6 +630,7 @@ Program build(const beir::Program& program, const Options& options) {
     result.report.baseline_register_bits = before.register_bits;
     result.report.accepted_group_moves = accepted_group_moves;
     if(options.arithmetic_request&&!g.model_cost) result.report.cost_model="fixed-op-width-v1";
+    }
 
     auto& rtl = result.rtl_program;
     std::vector<std::vector<NodeId>> delayed(normalized.signals.size());
@@ -729,6 +743,14 @@ Program build(const beir::Program& program, const Options& options) {
             throw rtlzz::ArithmeticError({"cost","cost_uncovered","materialized/projected state price differs",{},{}});
     }
     return result;
+}
+
+Program build(const beir::Program& program,const Options& options) {
+    return buildImpl(program,options,nullptr);
+}
+
+Program materializeSchedule(const beir::Program& program,const Options& options,const std::vector<int>& stages) {
+    return buildImpl(program,options,&stages);
 }
 
 void validateProgram(const Program& p) {

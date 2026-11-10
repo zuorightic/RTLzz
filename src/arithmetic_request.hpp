@@ -18,6 +18,8 @@ struct ArithmeticRequest {
     std::string model_bundle_sha256;
     std::string candidate_policy = "core-original-v1";
     std::string semantic_profile = "arithmetic-semantics-v2";
+    // v2 only. Explicit common implementation strategy, not model coverage.
+    std::string operator_boundary_policy;
     int latency = 1;
     int initiation_interval = 1;
     double target_period_ps = 0;

@@ -54,6 +54,8 @@ struct PipelineResult {
     std::optional<pipeline::Program> pipeline_program;
     std::optional<pipeline::Report> pipeline_report;
     std::string output_text;
+    // Body consumers must append these definitions at file scope.
+    std::string rtl_module_definitions;
     std::string rtl_debug_text;
     std::vector<rtlgen::RtlDebugSignal> rtl_debug_signals;
     std::string error_debug_text;
