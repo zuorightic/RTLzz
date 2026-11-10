@@ -24,6 +24,7 @@ struct ConditionalStageBoundary {
 struct ConditionalBoundaryPrice {
     bool covered=false,joint_qualified=false;
     std::string reason,model_sha256,operator_model_sha256,layout_sha256;
+    std::string state_model_sha256,service_contract_sha256,diagnostics_json;
     double target_period_ps=0;
     std::vector<ConditionalStageBoundary> stages;
     // Exactly these disjoint non-node owners, each charged once per placement:
@@ -37,6 +38,8 @@ public:
     virtual ConditionalBoundaryPrice price(const Program&,const StateCostQuery&,
         const std::vector<ConditionalBoundaryRequest>&,const std::string& operator_model_sha256) const=0;
 };
+std::vector<ConditionalBoundaryRequest> conditionalBoundaryRequests(const Program&,
+    const std::vector<int>& placement,int last,const std::vector<NodeId>& controls);
 struct ConditionalView {
     std::string id,candidate_id;
     Program graph;

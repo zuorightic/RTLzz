@@ -117,9 +117,15 @@ Evaluation evaluate(const ConditionalView& view,const pipeline::Options& options
         result.report["total_area_um2"]=total;result.report["timing_violation_ps"]=violation;result.report["owner_area_um2"]=std::move(owner_json);
         result.report["stages"]=std::move(stages);result.report["state_query"]=*llvm::json::parse(stateCostQueryJson(state));
         result.report["boundary_model_sha256"]=quote.model_sha256;result.report["operator_model_sha256"]=request.model_bundle_sha256;
+        if(!quote.state_model_sha256.empty())result.report["state_model_sha256"]=quote.state_model_sha256;
+        if(!quote.service_contract_sha256.empty())result.report["service_contract_sha256"]=quote.service_contract_sha256;
+        if(!quote.diagnostics_json.empty()) {auto diagnostics=llvm::json::parse(quote.diagnostics_json);if(!diagnostics)fail("invalid boundary diagnostics JSON");result.report["boundary_diagnostics"]=std::move(*diagnostics);}
     } catch(const std::exception& error) {result.report["reason"]=std::string(error.what());}
     return result;
 }
+}
+std::vector<ConditionalBoundaryRequest> conditionalBoundaryRequests(const Program& p,const std::vector<int>& placement,int last,const std::vector<NodeId>& controls) {
+    return boundaryRequests(p,placement,last,controls);
 }
 ConditionalViews enumerateConditionalViews(const Program& source,const pipeline::Options& options,const rtlzz::ArithmeticRequest& policy,std::size_t limit) {
     if(!options.arithmetic_request||options.arithmetic_request->cost_mode!="fixed"||!limit)fail("fixed structural context and finite enumeration limit required");
