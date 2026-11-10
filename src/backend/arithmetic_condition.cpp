@@ -11,6 +11,34 @@ const O& obj(const O& o,const char* key){auto p=o.getObject(key);if(!p)throw std
 const A& arr(const O& o,const char* key){auto p=o.getArray(key);if(!p)throw std::runtime_error(std::string("missing array ")+key);return *p;}
 std::string str(const O& o,const char* key){auto p=o.getString(key);if(!p)throw std::runtime_error(std::string("missing string ")+key);return p->str();}
 double num(const O& o,const char* key){auto p=o.getNumber(key);if(!p||!std::isfinite(*p))throw std::runtime_error(std::string("invalid number ")+key);return *p;}
+std::string mask(const O& spec,const std::string& key,int width){
+    auto raw=spec.getString(key);if(spec.get(key)&&!raw)throw std::runtime_error("invalid consumer known-bit mask");
+    std::string value=raw?raw->str():"0x0";if(value.size()>4096)throw std::runtime_error("invalid consumer known-bit mask");
+    if(value.rfind("0x",0)==0||value.rfind("0X",0)==0)value.erase(0,2);if(value.empty())throw std::runtime_error("invalid consumer known-bit mask");
+    for(char c:value)if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F')))throw std::runtime_error("invalid consumer known-bit mask");
+    auto bit=[&](int i){if(std::size_t(i/4)>=value.size())return false;char c=value[value.size()-1-i/4];int n=c<='9'?c-'0':c<='F'?c-'A'+10:c-'a'+10;return bool((n>>(i%4))&1);};
+    for(int i=width;i<int(value.size()*4);++i)if(bit(i))throw std::runtime_error("consumer known-bit mask out of range");return value;
+}
+bool maskBit(const std::string& value,int i){if(std::size_t(i/4)>=value.size())return false;char c=value[value.size()-1-i/4];int n=c<='9'?c-'0':c<='F'?c-'A'+10:c-'a'+10;return (n>>(i%4))&1;}
+void consumerFeatures(const O& descriptor,F& f){
+    for(auto name:{"consumer_lhs_active_bits","consumer_rhs_active_bits","consumer_lhs_zero_lsb_run","consumer_rhs_zero_lsb_run","consumer_lhs_zero_msb_run","consumer_rhs_zero_msb_run","consumer_add_overlap_bits","consumer_add_carry_span","consumer_known_one_bits","consumer_nonzero_carry"})f[name]=0;
+    for(const auto& value:arr(obj(descriptor,"local_context"),"consumers")){
+        auto c=value.getAsObject();if(!c)throw std::runtime_error("invalid consumer");const auto& spec=obj(*c,"spec");auto result=spec.getInteger("result_width");if(!result||*result<1||*result>257)throw std::runtime_error("invalid consumer width");
+        int low[2],high[2],index=0,ones=0;
+        for(auto prefix:{std::string("lhs"),std::string("rhs")}){
+            auto width=spec.getInteger(prefix+"_width");if(!width||*width<1||*width>257)throw std::runtime_error("invalid consumer width");int live=std::min(*width,*result);
+            auto zero=mask(spec,prefix+"_zero_hex",*width),one=mask(spec,prefix+"_one_hex",*width);int zeros=0,known=0;
+            for(int i=0;i<*width;++i){bool z=maskBit(zero,i),o=maskBit(one,i);if(z&&o)throw std::runtime_error("contradictory consumer known bits");if(i<live){zeros+=z;known+=o;}}
+            ones+=known;int lsb=0,msb=0;while(lsb<live&&maskBit(zero,lsb))++lsb;while(msb<live&&maskBit(zero,live-1-msb))++msb;
+            f["consumer_"+prefix+"_active_bits"]=std::max(f["consumer_"+prefix+"_active_bits"],double(live-zeros-known));
+            f["consumer_"+prefix+"_zero_lsb_run"]=std::max(f["consumer_"+prefix+"_zero_lsb_run"],double(lsb));
+            f["consumer_"+prefix+"_zero_msb_run"]=std::max(f["consumer_"+prefix+"_zero_msb_run"],double(msb));low[index]=lsb;high[index]=live-msb;++index;
+        }
+        f["consumer_add_overlap_bits"]=std::max(f["consumer_add_overlap_bits"],double(std::max(0,std::min({high[0],high[1],int(*result)})-std::max(low[0],low[1]))));
+        f["consumer_add_carry_span"]=std::max(f["consumer_add_carry_span"],double(std::max(0,std::min(std::max(high[0],high[1])+1,int(*result))-std::max(low[0],low[1]))));
+        f["consumer_known_one_bits"]=std::max(f["consumer_known_one_bits"],double(ones));auto carryValue=spec.getString("carry");if(spec.get("carry")&&!carryValue)throw std::runtime_error("invalid consumer carry");auto carry=carryValue.value_or("zero");if(carry!="zero"&&carry!="one"&&carry!="dynamic")throw std::runtime_error("invalid consumer carry");f["consumer_nonzero_carry"]=std::max(f["consumer_nonzero_carry"],double(carry!="zero"));
+    }
+}
 double infer(const O& p,const F& f,unsigned depth=0){
     if(depth>4)throw std::runtime_error("recursive predictor");
     auto kind=str(p,"kind");double value=0;
@@ -39,6 +67,7 @@ OperatorConditionEstimate operatorConditionEstimate(const O& model,const O& desc
     OperatorConditionEstimate result;
     try{
         auto f=operatorQueryFeatures(descriptor);const auto& flow=obj(descriptor,"flow_context");
+        consumerFeatures(descriptor,f);
         if(str(model,"version")!="operator-condition-function-v1"||str(flow,"profile_sha256")!=str(model,"profile_sha256")||str(flow,"boundary_policy")!=str(model,"operator_boundary_policy")||str(flow,"target_platform")!="asap7"||str(flow,"evaluation_stage")!="grt")throw std::runtime_error("model flow context mismatch");
         f["width_product"]=f.at("lhs_width")*f.at("rhs_width");f["width_result_product"]=std::pow(f.at("result_width"),2);
         f["lhs_result_product"]=f.at("lhs_width")*f.at("result_width");f["rhs_result_product"]=f.at("rhs_width")*f.at("result_width");
@@ -48,7 +77,7 @@ OperatorConditionEstimate operatorConditionEstimate(const O& model,const O& desc
         double terms=0;for(int i=static_cast<int>(al);i<static_cast<int>(ah);++i)terms+=std::max(0.,std::min(bh,r-i)-bl);f["retained_product_terms"]=terms;
         auto op=str(obj(obj(descriptor,"local_context"),"producer"),"operation");auto entry=obj(model,"operations").getObject(op);if(!entry)throw std::runtime_error("unknown operator");auto status=str(*entry,"status");
         if(status!="passed_independent"&&!(allow_candidate&&status=="awaiting_independent"))throw std::runtime_error("operator function unqualified");
-        for(auto name:{"lhs_one_count","rhs_one_count","carry_dynamic","carry_one","consumer_mul","consumer_addcarry"})if(f.at(name))throw std::runtime_error("unsupported operand or consumer semantics");
+        for(auto name:{"lhs_one_count","rhs_one_count","carry_dynamic","carry_one","consumer_mul","consumer_addcarry","consumer_known_one_bits","consumer_nonzero_carry"})if(f.at(name))throw std::runtime_error("unsupported operand or consumer semantics");
         for(auto prefix:{std::string("lhs"),std::string("rhs")})if(f.at(prefix+"_zero_count")!=f.at(prefix+"_zero_lsb_run")+f.at(prefix+"_zero_msb_run"))throw std::runtime_error("interior known-zero pattern outside first interval domain");
         if(f.at("consumer_count")>1)throw std::runtime_error("unsupported consumer count");
         if(obj(*entry,"domain").get("local_load_family")&&(f.at("capture_banks")>2||std::max({f.at("consumer_lhs_max"),f.at("consumer_rhs_max"),f.at("consumer_result_max")})>f.at("result_width")+1))throw std::runtime_error("outside validated local load family");
