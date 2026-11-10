@@ -1,6 +1,7 @@
 #include "arithmetic_request.hpp"
 #include "backend/arithmetic_primitives.hpp"
 #include "backend/arithmetic_composite.hpp"
+#include "backend/arithmetic_condition_provider.hpp"
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/SHA256.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -102,6 +103,15 @@ void validateArithmeticRequest(const ArithmeticRequest& r,int n) {
         auto model=object(bytes);
         if(!r.operator_boundary_policy.empty()&&model.getString("operator_boundary_policy").value_or("")!=r.operator_boundary_policy)
             bad("cost_uncovered","model does not qualify the requested operator boundary strategy");
+        // The step-5 conditional function has its own frozen schema. It is a
+        // node component; whole-pipeline qualification is checked separately.
+        if(model.getString("version")==pred::beir::arithmetic::kConditionalOperatorModel) {
+            if(r.version!="arithmetic-request-v2"||r.target_platform!="asap7"||r.operator_boundary_policy!="unsigned-op-hierarchy-v1"||
+               string(model,"profile_sha256")!=r.platform_profile_sha256||string(model,"quality_status")!="isolated_functions_passed"||
+               model.getBoolean("full_D_ready")!=false||model.getBoolean("test_only").value_or(false))
+                bad("cost_uncovered","conditional node model identity or independent quality mismatch");
+            return;
+        }
         if(string(model,"target_platform")!=r.target_platform || string(model,"platform_profile_sha256")!=r.platform_profile_sha256)bad("cost_uncovered","model platform/domain identity mismatch");
         const auto version=string(model,"version");
         const bool ordinary=version=="arithmetic-backend-model-v1"&&string(model,"feature_schema")=="arithmetic-physical-features-v2";

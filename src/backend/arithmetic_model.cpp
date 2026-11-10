@@ -1,6 +1,7 @@
 #include "backend/arithmetic_model.hpp"
 #include "backend/arithmetic_primitives.hpp"
 #include "backend/arithmetic_composite.hpp"
+#include "backend/arithmetic_condition_provider.hpp"
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <algorithm>
@@ -360,6 +361,7 @@ std::unique_ptr<CostProvider> makeCostProvider(const Program& p,const rtlzz::Ari
         auto parsed=llvm::json::parse((*file)->getBuffer());
         if(!parsed){llvm::consumeError(parsed.takeError());fail("invalid model JSON");}
         auto bundle=parsed->getAsObject();if(!bundle)fail("model bundle must be an object");
+        if(bundle->getString("version")==kConditionalOperatorModel)return std::make_unique<ConditionalOperatorCostProvider>(p,r);
         if(bundle->getString("version")==kPublishedPrimitiveBundle)return std::make_unique<PublishedPrimitiveCostProvider>(p,r);
         if(bundle->getString("version")==kComponentManifest)return std::make_unique<CompositeCostProvider>(p,r);
         return std::make_unique<ModelCostProvider>(p,r);
