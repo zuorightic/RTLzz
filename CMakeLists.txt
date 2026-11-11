@@ -84,6 +84,10 @@ endif()
 file(GLOB_RECURSE PREDICATE_EXPAND_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/src/*.cpp"
 )
+# The frozen reset v1 experiment is a standalone predecessor; v2 exports the
+# same numerical API. Keep both source snapshots, link one implementation.
+list(REMOVE_ITEM PREDICATE_EXPAND_SOURCES
+    "${PROJECT_SOURCE_DIR}/src/backend/arithmetic_reset_function.cpp")
 
 add_library(predicate-expand-objects OBJECT ${PREDICATE_EXPAND_SOURCES})
 add_library(predicate-expand::objects ALIAS predicate-expand-objects)
@@ -138,6 +142,10 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
     add_executable(predicate-expand main/main.cpp)
     target_link_libraries(predicate-expand PRIVATE predicate-expand-objects)
     configure_debug_executable(predicate-expand)
+
+    add_executable(rtlzz-d main/arithmetic_d.cpp)
+    target_link_libraries(rtlzz-d PRIVATE predicate-expand-objects)
+    configure_debug_executable(rtlzz-d)
 
     add_custom_command(TARGET predicate-expand POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
