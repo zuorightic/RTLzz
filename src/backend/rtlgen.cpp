@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdint>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -163,7 +164,8 @@ static void emitLocList(std::ostream& os, const std::vector<DebugLoc>& locs) {
 
 class Emitter {
 public:
-    explicit Emitter(const beir::Program& program, const pipeline::Program* pipeline = nullptr, bool arithmetic_boundaries = false)
+    explicit Emitter(const beir::Program& program, const pipeline::Program* pipeline = nullptr, bool arithmetic_boundaries = false,
+                     const std::vector<beir::arithmetic::ReductionRegion>& reductions = {})
         : program_(program), pipeline_(pipeline && pipeline->options.register_stages > 0 ? pipeline : nullptr), arithmetic_boundaries_(arithmetic_boundaries) {
         if(arithmetic_boundaries_)for(const auto& region:program_.arithmetic_regions)
             if(region.template_version=="softfloat3d-bitvector-mul-v1")
@@ -182,6 +184,13 @@ public:
         }
         for (const auto& signal : program_.signals) {
             name_to_node_[signal.name] = signal.id;
+        }
+        for(const auto& r:reductions){
+            if(!arithmetic_boundaries_||r.additions.size()<2||r.members.empty()||!pipeline_)
+                throw std::runtime_error("invalid G reduction emission contract");
+            for(auto n:r.members)if(register_nodes_.count(n)||!reduction_members_.insert(n).second)
+                throw std::runtime_error("overlapping or registered G reduction member");
+            reduction_roots_.emplace(r.root,r);
         }
     }
 
@@ -294,6 +303,8 @@ private:
     const beir::Program& program_;
     const pipeline::Program* pipeline_ = nullptr;
     bool arithmetic_boundaries_ = false;
+    std::set<NodeId> reduction_members_;
+    std::map<NodeId,beir::arithmetic::ReductionRegion> reduction_roots_;
     std::unordered_set<NodeId> register_nodes_;
     std::unordered_map<std::string, NodeId> name_to_node_;
 
@@ -777,7 +788,7 @@ private:
     }
 
     bool arithmeticBoundary(const beir::Signal& signal) const {
-        if(!arithmetic_boundaries_||!signal.driver||register_nodes_.count(signal.id))return false;
+        if(!arithmetic_boundaries_||!signal.driver||register_nodes_.count(signal.id)||reduction_members_.count(signal.id))return false;
         const auto& d=*signal.driver;
         bool selected=d.kind==beir::OperationKind::AddCarry ||
             (d.kind==beir::OperationKind::Binary&&(d.op==beir::OpCode::Mul||d.op==beir::OpCode::Add));
@@ -792,7 +803,31 @@ private:
         return sanitizeIdentifier(program_.function_name)+"__rtlzz_arith_"+std::to_string(id);
     }
 
+    NodeId reductionLaunch(NodeId origin,int stage) const {
+        if(!pipeline_)throw std::runtime_error("G reduction lacks materialized placement");
+        NodeId n=origin;int at=pipeline_->stages.at(origin);
+        while(at<stage){auto r=std::find_if(pipeline_->registers.begin(),pipeline_->registers.end(),[&](const auto& r){return r.source==n&&r.stage==at+1&&!r.is_valid;});
+            if(r==pipeline_->registers.end())throw std::runtime_error("G region leaf lacks actual register chain");n=r->node;++at;}
+        if(at!=stage)throw std::runtime_error("G region leaf stage differs");return n;
+    }
+
+    std::set<NodeId> reductionInputs(const beir::arithmetic::ReductionRegion& r) const {
+        std::set<NodeId> inputs;for(const auto& term:r.terms)for(auto b:term)inputs.insert(reductionLaunch(b.source,r.stage));return inputs;
+    }
+
     void emitArithmeticModules(std::ostream& os) const {
+        for(const auto& [root,r]:reduction_roots_){
+            auto inputs=reductionInputs(r);
+            os<<"\n(* keep_hierarchy=1 *) module "<<arithmeticModuleName(root)<<"_reduce(";
+            for(auto n:inputs)os<<"input wire ["<<widthOf(program_.signal(n).type)-1<<":0] i"<<n<<", ";
+            os<<"output wire ["<<widthOf(program_.signal(root).type)-1<<":0] y);\n";
+            for(std::size_t j=0;j<r.terms.size();++j){std::map<int,beir::arithmetic::ReductionBit> columns;for(auto b:r.terms[j])columns.emplace(b.column,b);
+                os<<"wire ["<<r.width-1<<":0] t"<<j<<" = {";
+                for(int c=r.width;c-->0;){if(c+1!=r.width)os<<", ";auto b=columns.find(c);
+                    if(b==columns.end())os<<"1'b0";else os<<"i"<<reductionLaunch(b->second.source,r.stage)<<"["<<b->second.bit<<"]";}
+                os<<"};\n";}
+            os<<"wire ["<<r.width-1<<":0] sum = ";for(std::size_t j=0;j<r.terms.size();++j){if(j)os<<" + ";os<<"t"<<j;}os<<";\nassign y=sum;\nendmodule\n";
+        }
         for(const auto& signal:program_.signals)if(arithmeticBoundary(signal)){
             auto d=*signal.driver;
             os<<"\n(* keep_hierarchy=1 *) module "<<arithmeticModuleName(signal.id)<<"(";
@@ -812,6 +847,12 @@ private:
                 continue;
             }
             if (signal.driver) {
+                if(reduction_members_.count(signal.id)){
+                    auto found=reduction_roots_.find(signal.id);if(found==reduction_roots_.end())continue;
+                    const auto& r=found->second;auto inputs=reductionInputs(r);
+                    os<<"    (* keep_hierarchy=1 *) "<<arithmeticModuleName(r.root)<<"_reduce rtlzz_reduce_"<<r.root<<"(";
+                    for(auto n:inputs)os<<".i"<<n<<"("<<sig(n)<<"), ";os<<".y("<<sig(r.root)<<"));\n";continue;
+                }
                 if(arithmeticBoundary(signal)){
                     os<<"    (* keep_hierarchy=1 *) "<<arithmeticModuleName(signal.id)<<" rtlzz_arith_"<<signal.id<<"(";
                     for(std::size_t i=0;i<signal.driver->operands.size();++i){if(i)os<<", ";os<<".a"<<i<<"("<<operand(signal.driver->operands[i])<<")";}
@@ -1306,6 +1347,18 @@ std::string emitSystemVerilog(const pipeline::Program& program) {
 
 std::string emitSystemVerilogWithArithmeticBoundaries(const pipeline::Program& program) {
     return Emitter(program.rtl_program,&program,true).emit();
+}
+
+std::string emitSystemVerilogWithReductionBoundaries(const pipeline::Program& program,
+    const std::vector<beir::arithmetic::ReductionRegion>& regions) {
+    auto expected=beir::arithmetic::reductionRegions(program.combinational,program.stages,program.options.register_stages);
+    if(expected.size()!=regions.size())throw std::runtime_error("stale G region emission inventory");
+    for(std::size_t i=0;i<expected.size();++i){const auto& a=expected[i];const auto& b=regions[i];
+        if(a.root!=b.root||a.stage!=b.stage||a.width!=b.width||a.members!=b.members||a.additions!=b.additions||a.terms.size()!=b.terms.size())throw std::runtime_error("G region emission identity differs");
+        for(std::size_t j=0;j<a.terms.size();++j){if(a.terms[j].size()!=b.terms[j].size())throw std::runtime_error("G region emission terms differ");
+            for(std::size_t k=0;k<a.terms[j].size();++k){auto x=a.terms[j][k],y=b.terms[j][k];if(x.source!=y.source||x.bit!=y.bit||x.column!=y.column)throw std::runtime_error("G region emission bit map differs");}}
+    }
+    return Emitter(program.rtl_program,&program,true,regions).emit();
 }
 
 std::string emitSystemVerilogWithArithmeticBoundaries(const beir::Program& program) {

@@ -2,6 +2,7 @@
 
 #include "backend/beir.hpp"
 #include "backend/pipeline.hpp"
+#include "backend/arithmetic_reduction.hpp"
 
 #include <optional>
 #include <string>
@@ -37,6 +38,10 @@ std::string emitSystemVerilog(const pipeline::Program& program);
 // mapped boundary/area qualification remain separate experiment requirements.
 std::string emitSystemVerilogWithArithmeticBoundaries(const pipeline::Program&);
 std::string emitSystemVerilogWithArithmeticBoundaries(const beir::Program&);
+// G successor: caller supplies the same pure-discovery regions used in pricing.
+// Each region is emitted once, with no kept Add hierarchy inside it.
+std::string emitSystemVerilogWithReductionBoundaries(const pipeline::Program&,
+    const std::vector<beir::arithmetic::ReductionRegion>&);
 struct ArithmeticBoundaryBody { std::string body, module_definitions; };
 ArithmeticBoundaryBody emitSystemVerilogBodyWithArithmeticBoundaries(
     const pipeline::Program&,const std::vector<std::pair<std::string,std::string>>&);

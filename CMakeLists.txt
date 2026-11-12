@@ -147,6 +147,10 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
     target_link_libraries(rtlzz-d PRIVATE predicate-expand-objects)
     configure_debug_executable(rtlzz-d)
 
+    add_executable(rtlzz-fused-d main/arithmetic_fused_d.cpp)
+    target_link_libraries(rtlzz-fused-d PRIVATE predicate-expand-objects)
+    configure_debug_executable(rtlzz-fused-d)
+
     add_custom_command(TARGET predicate-expand POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${PROJECT_SOURCE_DIR}/third_party/vulsim/vullib"
