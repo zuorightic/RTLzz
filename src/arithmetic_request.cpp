@@ -81,7 +81,7 @@ void validateArithmeticRequest(const ArithmeticRequest& r,int n) {
     if(r.initiation_interval!=1)bad("invalid_request","only II=1 is implemented");
     if(!std::isfinite(r.target_period_ps) || r.target_period_ps<=0)bad("invalid_request","target period must be finite and positive ps");
     if(r.semantic_profile!="arithmetic-semantics-v2")bad("template_ineligible","unregistered semantic profile: "+r.semantic_profile);
-    const std::set<std::string> policies{"core-original-v1","mul-candidates-v1","mul-template-v1"};
+    const std::set<std::string> policies{"core-original-v1","mul-candidates-v1","mul-template-v1","mul-width-tree-cuts-v1"};
     if(!policies.count(r.candidate_policy))bad("template_ineligible","unregistered candidate policy");
     if(r.candidate_policy=="mul-template-v1") {
         if(r.template_parameters.size()!=1||!r.template_parameters.count("block_width")||r.template_parameters.at("block_width")<2||r.template_parameters.at("block_width")>128)bad("template_ineligible","diagnostic template requires block_width in 2..128");

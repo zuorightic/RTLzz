@@ -8,6 +8,9 @@ namespace pred::beir::arithmetic {
 CandidateEnumeration visitCandidateGraphs(const Program& source,const rtlzz::ArithmeticRequest& request,
     const std::function<void(const Program&,const std::string&,const std::string&)>& visitor,
     const std::function<void(const std::string&,const rtlzz::ArithmeticDiagnostic&)>& rejected) {
+    if(request.candidate_policy=="mul-width-tree-cuts-v1")
+        throw rtlzz::ArithmeticError({"eligibility","candidate_policy_requires_block_inventory",
+            "mul-width-tree-cuts-v1 requires enumerateBlockPipelineViews and its explicit completeness/budget report",{},{}});
     std::vector<const ArithmeticRegion*> regions;
     for(const auto& r:source.arithmetic_regions)if(r.template_version=="mul-original-v1")regions.push_back(&r);
     if(regions.empty()&&request.candidate_policy=="mul-template-v1")throw rtlzz::ArithmeticError({"eligibility","template_ineligible","no eligible original Mul occurrence",{},{}});
