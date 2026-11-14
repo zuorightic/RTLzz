@@ -6,6 +6,7 @@
 #include "backend/arithmetic_core.hpp"
 #include "backend/mul_split.hpp"
 #include "backend/arithmetic_mul_precision.hpp"
+#include "backend/arithmetic_workload_provider.hpp"
 #include "backend/rtlgen.hpp"
 #include "backend/rtl_names.hpp"
 #include "pipelinev2/PipelineV2.h"
@@ -65,7 +66,7 @@ O graphJson(const Program& p){
 }
 // Same held-input service and output-capture behavior as the public D shell;
 // native emission deliberately grants no operator hierarchy/model identity.
-O emitNative(const pipeline::Program& p,const std::filesystem::path& out,double target){
+O emitNative(const pipeline::Program& p,const std::filesystem::path& out,double target,const WorkloadPlan* owners=nullptr){
     auto core=p;core.rtl_program.function_name="WorkloadCore";
     auto state=stateCostQuery(p,target,true);const auto& opts=p.options;
     std::vector<std::string> ports{"input wire clk","input wire rstn","input wire iv_data","input wire iv_wen","output reg ov"};
@@ -91,24 +92,28 @@ O emitNative(const pipeline::Program& p,const std::filesystem::path& out,double 
         }
         metadata.push_back(O{{"name",name},{"width",port.type.width},{"input",input},{"reset_hex",hex(words)}});
     }
-    auto rtl=rtlgen::emitSystemVerilog(core)+"\nmodule Workload("+join(ports)+");\n"+declarations+
+    auto rtl=(owners?rtlgen::emitSystemVerilogWithWorkloadOwners(core,*owners):rtlgen::emitSystemVerilog(core))+"\nmodule Workload("+join(ports)+");\n"+declarations+
         "WorkloadCore core("+join(bindings)+");\nalways @(posedge clk)if(!rstn)begin "+reset+"end else begin "+update+"end\nendmodule\n";
     write(out/"workload.sv",rtl);
     return O{{"top","Workload"},{"rtl","workload.sv"},{"sha256",rtlzz::arithmeticHash(rtl)},
         {"ports",std::move(metadata)},{"internal_stages",opts.register_stages},{"L_including_capture",opts.register_stages+1},
-        {"additional_input_service_cycles",1},{"model_boundary_qualification",false},{"emitter","native diagnostic; hierarchy qualification pending"}};
+        {"additional_input_service_cycles",1},{"model_boundary_qualification",false},
+        {"emitter",owners?"unsigned-workload-owners-v2; physical qualification pending":"native diagnostic; hierarchy qualification pending"}};
 }
 }
 int main(int argc,char** argv){try{
-    require(argc>=8&&argc<=10,"usage: export REPO SOURCE_REQUEST L LIMB_WIDTH BEAM_WIDTH MAX_EXTENSIONS NEW_OUTPUT [MUL_BLOCK_WIDTH [T_PS]]");
+    require(argc>=8&&argc<=12,"usage: export REPO SOURCE_REQUEST L LIMB_WIDTH BEAM_WIDTH MAX_EXTENSIONS NEW_OUTPUT [MUL_BLOCK_WIDTH [T_PS [native|owned [MODEL_BINDINGS]]]]");
     auto repo=std::filesystem::absolute(argv[1]),request=std::filesystem::absolute(argv[2]),out=std::filesystem::absolute(argv[7]);
     require(!std::filesystem::exists(out),"preserve existing output");
     auto doc=parse(read(request));require(doc.getAsObject()&&doc.getAsObject()->getObject("source"),"source metadata required");
     const auto& source=*doc.getAsObject()->getObject("source");std::filesystem::path path=text(source,"source");if(path.is_relative())path=request.parent_path()/path;
     require(rtlzz::arithmeticHash(read(path))==text(source,"generated_source_sha256"),"source SHA mismatch");
     const int L=integer(argv[3],1,256),limb=integer(argv[4],0,4096);
-    double target=1500.;if(argc==10){std::string raw(argv[9]);std::size_t used=0;target=std::stod(raw,&used);
+    double target=1500.;if(argc>=10){std::string raw(argv[9]);std::size_t used=0;target=std::stod(raw,&used);
         require(used==raw.size()&&std::isfinite(target)&&target>0&&target<1e9,"finite positive numerical T required");}
+    const std::string mode=argc>=11?argv[10]:"native";require(mode=="native"||mode=="owned","unknown workload boundary mode");
+    O models;std::string model_hash;
+    if(argc==12){require(mode=="owned","model bindings require owned boundaries");auto contents=read(argv[11]);auto parsed=parse(contents);require(parsed.getAsObject(),"model bindings must be an object");models=O(*parsed.getAsObject());model_hash=rtlzz::arithmeticHash(contents);}
     BoundedSchedulePolicy policy;policy.beam_width=integer(argv[5],1,4096);policy.max_extensions=integer(argv[6],1,10000000);
     pipelinev2::PipelineConfig config;config.source_name=text(source,"source_label");config.source_text=read(path);config.top_function=text(source,"top");
     config.clang_args={"-std=c++20","-I"+(repo/"vullib").string()};config.use_circt=false;
@@ -145,7 +150,15 @@ int main(int argc,char** argv){try{
         const auto directory=std::to_string(i);std::filesystem::create_directories(out/directory);
         auto actual=pipeline::materializeSchedule(split.graph,options,schedules.placements[i]);pipeline::validateProgram(actual);
         A stages;for(int n:actual.stages)stages.push_back(n);
-        auto state=stateCostQuery(actual,target,true);auto artifact=emitNative(actual,out/directory,target);
+        auto state=stateCostQuery(actual,target,true);std::optional<WorkloadPlan> owners;
+        if(mode=="owned"){
+            owners=workloadPlan(actual,target,fixed.platform_profile_sha256);
+            write(out/directory/"owners.json",json(workloadPlanJson(*owners)));
+            WorkloadCostProvider public_costs(actual,*owners,models,false),diagnostic_costs(actual,*owners,models,true);
+            write(out/directory/"costs-public.json",public_costs.componentReport(actual.combinational));
+            write(out/directory/"costs-diagnostic.json",diagnostic_costs.componentReport(actual.combinational));
+        }
+        auto artifact=emitNative(actual,out/directory,target,owners?&*owners:nullptr);
         write(out/directory/"state.json",stateCostQueryJson(state));
         views.push_back(O{{"directory",directory},{"placement",std::move(stages)},{"artifact",std::move(artifact)}});
     }
@@ -153,6 +166,7 @@ int main(int argc,char** argv){try{
         {"profile_sha256",fixed.platform_profile_sha256},{"L",L},{"II",1},{"split_policy",kLimbSplitPolicy},
         {"input_valid_port",options.input_valid_name},{"output_valid_port",options.output_valid_name},
         {"mul_block_width",mul_block},
+        {"boundary_mode",mode},{"model_bindings_sha256",model_hash},
         {"expansions",std::move(split.expansions)},{"search",boundedScheduleReport(schedules,policy)},{"views",std::move(views)},
         {"search_ms",search_ms},
         {"source_role","application_development_not_training_or_independent"},{"diagnostic_T_ps",target},

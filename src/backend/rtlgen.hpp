@@ -3,6 +3,7 @@
 #include "backend/beir.hpp"
 #include "backend/pipeline.hpp"
 #include "backend/arithmetic_reduction.hpp"
+#include "backend/arithmetic_workload_plan.hpp"
 
 #include <optional>
 #include <string>
@@ -42,6 +43,8 @@ std::string emitSystemVerilogWithArithmeticBoundaries(const beir::Program&);
 // Each region is emitted once, with no kept Add hierarchy inside it.
 std::string emitSystemVerilogWithReductionBoundaries(const pipeline::Program&,
     const std::vector<beir::arithmetic::ReductionRegion>&);
+std::string emitSystemVerilogWithWorkloadOwners(const pipeline::Program&,
+    const beir::arithmetic::WorkloadPlan&);
 struct ArithmeticBoundaryBody { std::string body, module_definitions; };
 ArithmeticBoundaryBody emitSystemVerilogBodyWithArithmeticBoundaries(
     const pipeline::Program&,const std::vector<std::pair<std::string,std::string>>&);

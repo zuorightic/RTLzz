@@ -80,7 +80,10 @@ std::map<std::string,double> wideOperatorQueryFeatures(const O& q){
  f["consumer_operand_pin_uses"]=uses;f["consumer_mapping_position_mean"]=position/std::max(1.,uses);return f;
 }
 std::string wideOperatorCore(const O& q,const std::string& name){
- wideOperatorQueryFeatures(q);if(name.empty()||!(std::isalpha(static_cast<unsigned char>(name[0]))||name[0]=='_')||std::any_of(name.begin(),name.end(),[](unsigned char c){return !std::isalnum(c)&&c!='_';}))throw std::runtime_error("safe wide module identifier required");Spec s(obj(obj(q,"local_context"),"producer"));std::ostringstream out;
+ wideOperatorQueryFeatures(q);return wideOperatorSpecCore(obj(obj(q,"local_context"),"producer"),name);
+}
+std::string wideOperatorSpecCore(const O& spec,const std::string& name){
+ if(name.empty()||!(std::isalpha(static_cast<unsigned char>(name[0]))||name[0]=='_')||std::any_of(name.begin(),name.end(),[](unsigned char c){return !std::isalnum(c)&&c!='_';}))throw std::runtime_error("safe wide module identifier required");Spec s(spec);std::ostringstream out;
  auto masked=[&](bool rhs){int w=rhs?s.b:s.a;auto z=rhs?s.bz:s.az,o=rhs?s.bo:s.ao;auto live=llvm::APInt::getLowBitsSet(B,w)&~(z|o);return "(("+std::string(rhs?"b":"a")+"&"+std::to_string(w)+"'h"+hex(live)+")|"+std::to_string(w)+"'h"+hex(o)+")";};std::string control=s.carry=="dynamic"?"cin":s.carry=="one"?"1'b1":"1'b0";bool swapped=s.swap();out<<"// unsigned-wide-family-hierarchy-v1\n(* keep_hierarchy=1 *) module "<<name<<"Core(input wire ["<<s.a-1<<":0] a,input wire ["<<s.b-1<<":0] b,input wire cin,output wire ["<<s.r-1<<":0] value);\nwire ["<<s.a-1<<":0] masked_a="<<masked(false)<<";\nwire ["<<s.b-1<<":0] masked_b="<<masked(true)<<";\nwire ["<<s.w-1<<":0] aa="<<s.w<<"'("<<(swapped?"masked_b":"masked_a")<<");\nwire ["<<s.w-1<<":0] bb="<<s.w<<"'("<<(swapped?"masked_a":"masked_b")<<");\n";
  std::string flag="1'b0";
  if(s.op=="add"||s.op=="adc"||s.op=="sub"||s.op=="sbb"){char sign=s.op=="add"||s.op=="adc"?'+':'-';out<<"wire ["<<s.w<<":0] extended={1'b0,aa}"<<sign<<"{1'b0,bb}"<<sign<<s.w+1<<"'("<<control<<");\nwire ["<<s.w-1<<":0] native_value=extended["<<s.w-1<<":0];\n";flag="extended["+std::to_string(s.w)+"]";}

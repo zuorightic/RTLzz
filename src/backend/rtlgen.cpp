@@ -1,4 +1,5 @@
 #include "backend/rtlgen.hpp"
+#include "backend/arithmetic_wide_query.hpp"
 #include "backend/rtl_names.hpp"
 
 #include <algorithm>
@@ -165,7 +166,8 @@ static void emitLocList(std::ostream& os, const std::vector<DebugLoc>& locs) {
 class Emitter {
 public:
     explicit Emitter(const beir::Program& program, const pipeline::Program* pipeline = nullptr, bool arithmetic_boundaries = false,
-                     const std::vector<beir::arithmetic::ReductionRegion>& reductions = {})
+                     const std::vector<beir::arithmetic::ReductionRegion>& reductions = {},
+                     const beir::arithmetic::WorkloadPlan* workload = nullptr)
         : program_(program), pipeline_(pipeline && pipeline->options.register_stages > 0 ? pipeline : nullptr), arithmetic_boundaries_(arithmetic_boundaries) {
         if(arithmetic_boundaries_)for(const auto& region:program_.arithmetic_regions)
             if(region.template_version=="softfloat3d-bitvector-mul-v1")
@@ -186,12 +188,15 @@ public:
             name_to_node_[signal.name] = signal.id;
         }
         for(const auto& r:reductions){
-            if(!arithmetic_boundaries_||r.additions.size()<2||r.members.empty()||!pipeline_)
+            if(!arithmetic_boundaries_||r.additions.size()<2||r.members.empty()||(!pipeline_&&!workload))
                 throw std::runtime_error("invalid G reduction emission contract");
             for(auto n:r.members)if(register_nodes_.count(n)||!reduction_members_.insert(n).second)
                 throw std::runtime_error("overlapping or registered G reduction member");
             reduction_roots_.emplace(r.root,r);
         }
+        if(workload){workload_=true;workload_launches_=workload->launches;for(const auto& row:workload->operators){
+            if(register_nodes_.count(row.node)||reduction_members_.count(row.node)||!workload_operators_.emplace(row.node,&row).second)
+                throw std::runtime_error("invalid workload operator ownership");}}
     }
 
     std::string emit() {
@@ -305,6 +310,9 @@ private:
     bool arithmetic_boundaries_ = false;
     std::set<NodeId> reduction_members_;
     std::map<NodeId,beir::arithmetic::ReductionRegion> reduction_roots_;
+    bool workload_ = false;
+    std::map<NodeId,const beir::arithmetic::WorkloadOperator*> workload_operators_;
+    std::map<std::tuple<NodeId,int,int>,std::pair<NodeId,int>> workload_launches_;
     std::unordered_set<NodeId> register_nodes_;
     std::unordered_map<std::string, NodeId> name_to_node_;
 
@@ -788,6 +796,7 @@ private:
     }
 
     bool arithmeticBoundary(const beir::Signal& signal) const {
+        if(workload_)return workload_operators_.count(signal.id);
         if(!arithmetic_boundaries_||!signal.driver||register_nodes_.count(signal.id)||reduction_members_.count(signal.id))return false;
         const auto& d=*signal.driver;
         bool selected=d.kind==beir::OperationKind::AddCarry ||
@@ -804,7 +813,7 @@ private:
     }
 
     NodeId reductionLaunch(NodeId origin,int stage) const {
-        if(!pipeline_)throw std::runtime_error("G reduction lacks materialized placement");
+        if(!pipeline_){if(workload_&&stage==0)return origin;throw std::runtime_error("G reduction lacks materialized placement");}
         NodeId n=origin;int at=pipeline_->stages.at(origin);
         while(at<stage){auto r=std::find_if(pipeline_->registers.begin(),pipeline_->registers.end(),[&](const auto& r){return r.source==n&&r.stage==at+1&&!r.is_valid;});
             if(r==pipeline_->registers.end())throw std::runtime_error("G region leaf lacks actual register chain");n=r->node;++at;}
@@ -812,7 +821,11 @@ private:
     }
 
     std::set<NodeId> reductionInputs(const beir::arithmetic::ReductionRegion& r) const {
-        std::set<NodeId> inputs;for(const auto& term:r.terms)for(auto b:term)inputs.insert(reductionLaunch(b.source,r.stage));return inputs;
+        std::set<NodeId> inputs;for(const auto& term:r.terms)for(auto b:term)inputs.insert(reductionAtom(b,r.stage).first);return inputs;
+    }
+    std::pair<NodeId,int> reductionAtom(beir::arithmetic::ReductionBit b,int stage)const{
+        if(workload_){auto it=workload_launches_.find({b.source,b.bit,stage});if(it==workload_launches_.end())throw std::runtime_error("missing actual G launch bit");return it->second;}
+        return {reductionLaunch(b.source,stage),b.bit};
     }
 
     void emitArithmeticModules(std::ostream& os) const {
@@ -824,11 +837,14 @@ private:
             for(std::size_t j=0;j<r.terms.size();++j){std::map<int,beir::arithmetic::ReductionBit> columns;for(auto b:r.terms[j])columns.emplace(b.column,b);
                 os<<"wire ["<<r.width-1<<":0] t"<<j<<" = {";
                 for(int c=r.width;c-->0;){if(c+1!=r.width)os<<", ";auto b=columns.find(c);
-                    if(b==columns.end())os<<"1'b0";else os<<"i"<<reductionLaunch(b->second.source,r.stage)<<"["<<b->second.bit<<"]";}
+                    if(b==columns.end())os<<"1'b0";else {auto [n,bit]=reductionAtom(b->second,r.stage);os<<"i"<<n<<"["<<bit<<"]";}}
                 os<<"};\n";}
             os<<"wire ["<<r.width-1<<":0] sum = ";for(std::size_t j=0;j<r.terms.size();++j){if(j)os<<" + ";os<<"t"<<j;}os<<";\nassign y=sum;\nendmodule\n";
         }
         for(const auto& signal:program_.signals)if(arithmeticBoundary(signal)){
+            if(workload_){const auto& row=*workload_operators_.at(signal.id);
+                const auto* spec=row.query.getObject("local_context")->getObject("producer");
+                os<<beir::arithmetic::wideOperatorSpecCore(*spec,arithmeticModuleName(signal.id));continue;}
             auto d=*signal.driver;
             os<<"\n(* keep_hierarchy=1 *) module "<<arithmeticModuleName(signal.id)<<"(";
             for(std::size_t i=0;i<d.operands.size();++i){if(i)os<<", ";os<<"input wire ["<<widthOf(d.operands[i].type)-1<<":0] a"<<i;
@@ -854,6 +870,15 @@ private:
                     for(auto n:inputs)os<<".i"<<n<<"("<<sig(n)<<"), ";os<<".y("<<sig(r.root)<<"));\n";continue;
                 }
                 if(arithmeticBoundary(signal)){
+                    if(workload_){const auto& row=*workload_operators_.at(signal.id);const auto& spec=*row.query.getObject("local_context")->getObject("producer");
+                        const auto& d=*signal.driver;bool mux=d.kind==beir::OperationKind::Ite;
+                        auto a=mux?2:0,b=1;int wa=int(*spec.getInteger("lhs_width")),wb=int(*spec.getInteger("rhs_width"));
+                        os<<"    (* keep_hierarchy=1 *) "<<arithmeticModuleName(signal.id)<<"Core rtlzz_owner_"<<signal.id<<"(.a("<<wa<<"'("<<operand(d.operands.at(a))<<")), .b("<<wb<<"'("<<operand(d.operands.at(b))<<")), .cin(";
+                        if(mux)os<<operand(d.operands.at(0));else if(d.kind==beir::OperationKind::AddCarry)os<<operand(d.operands.at(2));else os<<"1'b0";
+                        int r=int(*spec.getInteger("result_width"));os<<"), .value(";
+                        if(r==widthOf(signal.type))os<<sig(signal.id);else os<<sig(signal.id)<<"["<<r-1<<":0]";os<<"));\n";
+                        if(r<widthOf(signal.type))os<<"    assign "<<sig(signal.id)<<"["<<widthOf(signal.type)-1<<":"<<r<<"] = '0;\n";
+                        continue;}
                     os<<"    (* keep_hierarchy=1 *) "<<arithmeticModuleName(signal.id)<<" rtlzz_arith_"<<signal.id<<"(";
                     for(std::size_t i=0;i<signal.driver->operands.size();++i){if(i)os<<", ";os<<".a"<<i<<"("<<operand(signal.driver->operands[i])<<")";}
                     os<<", .y("<<sig(signal.id)<<"));"<<debugComment(signal.driver->debug)<<"\n";
@@ -1363,6 +1388,14 @@ std::string emitSystemVerilogWithReductionBoundaries(const pipeline::Program& pr
 
 std::string emitSystemVerilogWithArithmeticBoundaries(const beir::Program& program) {
     return Emitter(program,nullptr,true).emit();
+}
+
+std::string emitSystemVerilogWithWorkloadOwners(const pipeline::Program& program,
+    const beir::arithmetic::WorkloadPlan& plan) {
+    auto expected=beir::arithmetic::workloadPlan(program,plan.target_ps,plan.profile_sha256);
+    if(llvm::json::Value(beir::arithmetic::workloadPlanJson(expected))!=llvm::json::Value(beir::arithmetic::workloadPlanJson(plan)))
+        throw std::runtime_error("stale or inconsistent workload owner plan");
+    return Emitter(program.rtl_program,&program,true,plan.reductions,&plan).emit();
 }
 
 ArithmeticBoundaryBody emitSystemVerilogBodyWithArithmeticBoundaries(const pipeline::Program& program,
